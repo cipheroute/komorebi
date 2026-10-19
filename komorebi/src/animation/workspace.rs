@@ -1723,6 +1723,13 @@ impl Animator {
             previous.finish(false, &mut self.border_surfaces);
         });
 
+        // the overlay of a running animation already covers the work area, so the real
+        // switch doesn't have to wait for anything: rapid switches stay as responsive as
+        // without animations
+        if replacing.is_some() {
+            let _ = command.ack.send(());
+        }
+
         let overlay = match self.overlays.get(&command.hmonitor) {
             Some(overlay) => Some(*overlay),
             None => on_window_thread(|| create_window(w!("komorebi-workspace-animation"), true))
