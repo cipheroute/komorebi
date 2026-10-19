@@ -32,7 +32,30 @@ use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
+use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::POINT;
+use windows::Win32::Foundation::SIZE;
+use windows::Win32::Graphics::Gdi::AC_SRC_ALPHA;
+use windows::Win32::Graphics::Gdi::AC_SRC_OVER;
+use windows::Win32::Graphics::Gdi::BI_RGB;
+use windows::Win32::Graphics::Gdi::BITMAPINFO;
+use windows::Win32::Graphics::Gdi::BITMAPINFOHEADER;
+use windows::Win32::Graphics::Gdi::BLENDFUNCTION;
+use windows::Win32::Graphics::Gdi::CreateCompatibleDC;
+use windows::Win32::Graphics::Gdi::CreateDIBSection;
+use windows::Win32::Graphics::Gdi::DIB_RGB_COLORS;
+use windows::Win32::Graphics::Gdi::DeleteDC;
+use windows::Win32::Graphics::Gdi::DeleteObject;
+use windows::Win32::Graphics::Gdi::GetDC;
+use windows::Win32::Graphics::Gdi::HALFTONE;
+use windows::Win32::Graphics::Gdi::HDC;
+use windows::Win32::Graphics::Gdi::ReleaseDC;
+use windows::Win32::Graphics::Gdi::SRCCOPY;
+use windows::Win32::Graphics::Gdi::SelectObject;
+use windows::Win32::Graphics::Gdi::SetBrushOrgEx;
+use windows::Win32::Graphics::Gdi::SetStretchBltMode;
+use windows::Win32::Graphics::Gdi::StretchBlt;
 use windows::Win32::Foundation::LPARAM;
 use windows::Win32::Foundation::LRESULT;
 use windows::Win32::Foundation::RECT;
@@ -60,6 +83,10 @@ use windows::Win32::UI::WindowsAndMessaging::MSG;
 use windows::Win32::UI::WindowsAndMessaging::PM_REMOVE;
 use windows::Win32::UI::WindowsAndMessaging::PeekMessageW;
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE;
+use windows::Win32::UI::WindowsAndMessaging::ULW_ALPHA;
+use windows::Win32::UI::WindowsAndMessaging::UpdateLayeredWindow;
+use windows::Win32::UI::WindowsAndMessaging::WS_EX_LAYERED;
 use windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE;
 use windows::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW;
 use windows::Win32::UI::WindowsAndMessaging::SetWindowPos;
@@ -75,6 +102,21 @@ use windows::core::w;
 
 /// How long the main thread waits for the overlay to be on screen before switching
 const OVERLAY_READY_TIMEOUT: Duration = Duration::from_millis(60);
+/// The wallpaper snapshot is shrunk by this factor before being blurred; DWM upscales
+/// thumbnails with a coarse filter, so larger factors make the blur visibly blocky
+const BLUR_DOWNSCALE: i32 = 2;
+/// How often the blurred wallpaper snapshot is retaken. Taking it makes live wallpaper
+/// engines render, so it is kept rare; the blur hides how old the snapshot is.
+const BLUR_MAX_AGE: Duration = Duration::from_secs(600);
+/// Source windows for thumbnails of our own content live far outside of any monitor
+const OFFSCREEN: i32 = -20000;
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn PrintWindow(hwnd: HWND, hdc: HDC, flags: u32) -> windows::core::BOOL;
+}
+
+const PW_RENDERFULLCONTENT: u32 = 2;
 
 #[derive(Copy, Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -113,6 +155,13 @@ pub struct WorkspaceAnimationConfig {
     /// Distance travelled by the SlideFade kinds, as a fraction of the work area (default: 0.2)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slide_fade_distance: Option<f64>,
+    /// Show the blurred wallpaper behind windows during the animation, so that windows with
+    /// acrylic or mica backdrops don't turn see-through while they move (default: true)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backdrop_blur: Option<bool>,
+    /// Blur radius in pixels of the backdrop (default: 40)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backdrop_blur_radius: Option<u32>,
 }
 
 lazy_static! {
@@ -232,6 +281,8 @@ struct Command {
 struct Thumbnail {
     id: isize,
     hwnd: isize,
+    /// Blurred wallpaper drawn right underneath the window, standing in for its backdrop
+    blur_patch: Option<isize>,
     incoming: bool,
     /// Rect of an outgoing window when the animation started (screen coordinates)
     start_rect: RECT,
@@ -242,6 +293,8 @@ struct Animation {
     work_area: Rect,
     wallpaper: Option<isize>,
     thumbnails: Vec<Thumbnail>,
+    /// Desktop rect and pixel size of the blur snapshot the patches are cut from
+    blur: Option<(RECT, i32, i32)>,
     forward: bool,
     kind: WorkspaceAnimationKind,
     started: Instant,
@@ -392,8 +445,298 @@ fn cubic_bezier(curve: [f64; 4], x: f64) -> f64 {
     sample(y1, y2, t)
 }
 
+fn bitmap_info(width: i32, height: i32) -> BITMAPINFO {
+    BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            // top-down
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// Box blurs BGRX pixels in place, three passes approximate a gaussian blur
+fn box_blur(pixels: &mut [u32], width: usize, height: usize, radius: usize) {
+    if radius == 0 || width == 0 || height == 0 {
+        return;
+    }
+
+    let mut scratch = pixels.to_vec();
+    for _ in 0..3 {
+        blur_pass(pixels, &mut scratch, width, height, radius, true);
+        blur_pass(&scratch, pixels, width, height, radius, false);
+    }
+}
+
+fn blur_pass(
+    source: &[u32],
+    target: &mut [u32],
+    width: usize,
+    height: usize,
+    radius: usize,
+    horizontal: bool,
+) {
+    let (lines, length) = if horizontal {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    let index = |line: usize, i: usize| {
+        if horizontal {
+            line * width + i
+        } else {
+            i * width + line
+        }
+    };
+
+    let window = (radius * 2 + 1) as u32;
+    for line in 0..lines {
+        let channel = |pixel: u32, shift: u32| (pixel >> shift) & 0xff;
+        let mut sums = [0u32; 3];
+        for offset in 0..window as usize {
+            let i = offset.saturating_sub(radius).min(length - 1);
+            let pixel = source[index(line, i)];
+            for (c, shift) in [16, 8, 0].into_iter().enumerate() {
+                sums[c] += channel(pixel, shift);
+            }
+        }
+
+        for i in 0..length {
+            target[index(line, i)] = 0xff00_0000
+                | (sums[0] / window) << 16
+                | (sums[1] / window) << 8
+                | (sums[2] / window);
+
+            let leaving = source[index(line, i.saturating_sub(radius))];
+            let entering = source[index(line, (i + radius + 1).min(length - 1))];
+            for (c, shift) in [16, 8, 0].into_iter().enumerate() {
+                sums[c] = sums[c] + channel(entering, shift) - channel(leaving, shift);
+            }
+        }
+    }
+}
+
+/// A blurred, shrunk snapshot of the desktop window, taken on a thread of its own since
+/// PrintWindow waits on explorer
+struct BlurSnapshot {
+    desktop: RECT,
+    width: i32,
+    height: i32,
+    pixels: Vec<u32>,
+}
+
+impl BlurSnapshot {
+    fn capture(radius: u32) -> Option<Self> {
+        let desktop_hwnd = desktop_window()?;
+        let desktop = raw_window_rect(desktop_hwnd)?;
+        let (width, height) = (desktop.right - desktop.left, desktop.bottom - desktop.top);
+        let (small_w, small_h) = (
+            (width / BLUR_DOWNSCALE).max(1),
+            (height / BLUR_DOWNSCALE).max(1),
+        );
+
+        let mut pixels = vec![0u32; (small_w * small_h) as usize];
+
+        unsafe {
+            let screen = GetDC(None);
+            let full_dc = CreateCompatibleDC(Some(screen));
+            let small_dc = CreateCompatibleDC(Some(screen));
+            let mut full_bits = std::ptr::null_mut();
+            let mut small_bits = std::ptr::null_mut();
+
+            let full = CreateDIBSection(
+                Some(full_dc),
+                &bitmap_info(width, height),
+                DIB_RGB_COLORS,
+                &mut full_bits,
+                None,
+                0,
+            );
+            let small = CreateDIBSection(
+                Some(small_dc),
+                &bitmap_info(small_w, small_h),
+                DIB_RGB_COLORS,
+                &mut small_bits,
+                None,
+                0,
+            );
+
+            if let (Ok(full), Ok(small)) = (&full, &small) {
+                let previous_full = SelectObject(full_dc, (*full).into());
+                let previous_small = SelectObject(small_dc, (*small).into());
+
+                let _ = PrintWindow(HWND(desktop_hwnd as _), full_dc, PW_RENDERFULLCONTENT);
+                SetStretchBltMode(small_dc, HALFTONE);
+                let _ = SetBrushOrgEx(small_dc, 0, 0, None);
+                let _ = StretchBlt(
+                    small_dc,
+                    0,
+                    0,
+                    small_w,
+                    small_h,
+                    Some(full_dc),
+                    0,
+                    0,
+                    width,
+                    height,
+                    SRCCOPY,
+                );
+
+                std::ptr::copy_nonoverlapping(
+                    small_bits.cast::<u32>(),
+                    pixels.as_mut_ptr(),
+                    pixels.len(),
+                );
+
+                SelectObject(full_dc, previous_full);
+                SelectObject(small_dc, previous_small);
+            }
+
+            if let Ok(full) = full {
+                let _ = DeleteObject(full.into());
+            }
+            if let Ok(small) = small {
+                let _ = DeleteObject(small.into());
+            }
+            let _ = DeleteDC(full_dc);
+            let _ = DeleteDC(small_dc);
+            ReleaseDC(None, screen);
+        }
+
+        let radius = (radius as i32 / BLUR_DOWNSCALE).max(1) as usize;
+        // three box blur passes of radius r approximate a gaussian of radius ~r * 1.7
+        box_blur(
+            &mut pixels,
+            small_w as usize,
+            small_h as usize,
+            (radius as f64 / 1.7).round().max(1.0) as usize,
+        );
+
+        Some(Self {
+            desktop,
+            width: small_w,
+            height: small_h,
+            pixels,
+        })
+    }
+}
+
+/// An off-screen layered window holding the blur snapshot, used as a thumbnail source
+struct BlurSurface {
+    hwnd: isize,
+    desktop: RECT,
+    width: i32,
+    height: i32,
+    taken: Instant,
+}
+
+impl BlurSurface {
+    fn new() -> Option<Self> {
+        let class_name = w!("komorebi-workspace-animation-blur");
+        let h_module = WindowsApi::module_handle_w().ok()?;
+        let window_class = WNDCLASSW {
+            hInstance: h_module.into(),
+            lpszClassName: class_name,
+            lpfnWndProc: Some(overlay_callback),
+            ..Default::default()
+        };
+        let _ = WindowsApi::register_class_w(&window_class);
+
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+                class_name,
+                class_name,
+                WS_POPUP,
+                OFFSCREEN,
+                OFFSCREEN,
+                1,
+                1,
+                None,
+                None,
+                Some(h_module.into()),
+                None,
+            )
+        }
+        .ok()?;
+
+        Some(Self {
+            hwnd: hwnd.0 as isize,
+            desktop: RECT::default(),
+            width: 0,
+            height: 0,
+            taken: Instant::now(),
+        })
+    }
+
+    fn upload(&mut self, snapshot: &BlurSnapshot) {
+        let (width, height) = (snapshot.width, snapshot.height);
+        unsafe {
+            let screen = GetDC(None);
+            let memory = CreateCompatibleDC(Some(screen));
+            let mut bits = std::ptr::null_mut();
+            if let Ok(bitmap) = CreateDIBSection(
+                Some(memory),
+                &bitmap_info(width, height),
+                DIB_RGB_COLORS,
+                &mut bits,
+                None,
+                0,
+            ) {
+                std::ptr::copy_nonoverlapping(
+                    snapshot.pixels.as_ptr(),
+                    bits.cast::<u32>(),
+                    snapshot.pixels.len(),
+                );
+                let previous = SelectObject(memory, bitmap.into());
+                let blend = BLENDFUNCTION {
+                    BlendOp: AC_SRC_OVER as u8,
+                    BlendFlags: 0,
+                    SourceConstantAlpha: 255,
+                    AlphaFormat: AC_SRC_ALPHA as u8,
+                };
+
+                let _ = UpdateLayeredWindow(
+                    HWND(self.hwnd as _),
+                    Some(screen),
+                    Some(&POINT {
+                        x: OFFSCREEN,
+                        y: OFFSCREEN,
+                    }),
+                    Some(&SIZE {
+                        cx: width,
+                        cy: height,
+                    }),
+                    Some(memory),
+                    Some(&POINT { x: 0, y: 0 }),
+                    COLORREF(0),
+                    Some(&blend),
+                    ULW_ALPHA,
+                );
+
+                SelectObject(memory, previous);
+                let _ = DeleteObject(bitmap.into());
+                let _ = ShowWindow(HWND(self.hwnd as _), SW_SHOWNOACTIVATE);
+            }
+            let _ = DeleteDC(memory);
+            ReleaseDC(None, screen);
+        }
+
+        self.desktop = snapshot.desktop;
+        self.width = width;
+        self.height = height;
+        self.taken = Instant::now();
+    }
+}
+
 impl Animation {
-    fn start(command: &Command, overlay: isize) -> Self {
+    fn start(command: &Command, overlay: isize, blur: Option<&BlurSurface>) -> Self {
         let config = CONFIG.lock().clone();
         let duration = config.duration.unwrap_or_else(|| {
             ANIMATION_DURATION_PER_ANIMATION
@@ -423,13 +766,24 @@ impl Animation {
         sort_bottom_to_top(&mut outgoing);
         sort_bottom_to_top(&mut incoming);
 
+        let blur = blur.filter(|blur| blur.width > 0 && config.backdrop_blur.unwrap_or(true));
+        let fades = !matches!(
+            config.kind.unwrap_or_default(),
+            WorkspaceAnimationKind::Slide | WorkspaceAnimationKind::SlideVertical
+        );
+        let blur = blur.filter(|_| !fades);
+
         let mut thumbnails = vec![];
         for (hwnds, is_incoming) in [(outgoing, false), (incoming, true)] {
             for hwnd in hwnds {
+                // registration order is drawing order, so each window's blur patch goes
+                // right underneath it
+                let blur_patch = blur.and_then(|blur| register(overlay, blur.hwnd));
                 if let Some(id) = register(overlay, hwnd) {
                     thumbnails.push(Thumbnail {
                         id,
                         hwnd,
+                        blur_patch,
                         incoming: is_incoming,
                         start_rect: raw_window_rect(hwnd).unwrap_or_default(),
                     });
@@ -442,6 +796,7 @@ impl Animation {
             work_area: wa,
             wallpaper,
             thumbnails,
+            blur: blur.map(|blur| (blur.desktop, blur.width, blur.height)),
             forward: command.forward,
             kind: config.kind.unwrap_or_default(),
             started: Instant::now(),
@@ -545,12 +900,31 @@ impl Animation {
             };
 
             update(thumbnail.id, destination, None, opacity);
+
+            // the blurred wallpaper which is behind the window at its current position
+            if let (Some(patch), Some((desktop, width, height))) = (thumbnail.blur_patch, self.blur)
+            {
+                let scale = f64::from(BLUR_DOWNSCALE);
+                let to_snapshot = |value: i32, origin: i32, limit: i32| {
+                    ((f64::from(value - origin) / scale).round() as i32).clamp(0, limit)
+                };
+                let source = RECT {
+                    left: to_snapshot(destination.left + wa.left, desktop.left, width),
+                    top: to_snapshot(destination.top + wa.top, desktop.top, height),
+                    right: to_snapshot(destination.right + wa.left, desktop.left, width),
+                    bottom: to_snapshot(destination.bottom + wa.top, desktop.top, height),
+                };
+                update(patch, destination, Some(source), opacity);
+            }
         }
     }
 
     fn finish(self, hide_overlay: bool) {
         for thumbnail in &self.thumbnails {
             let _ = unsafe { DwmUnregisterThumbnail(thumbnail.id) };
+            if let Some(patch) = thumbnail.blur_patch {
+                let _ = unsafe { DwmUnregisterThumbnail(patch) };
+            }
         }
 
         if let Some(wallpaper) = self.wallpaper {
@@ -568,10 +942,40 @@ impl Animation {
 fn run(receiver: Receiver<Command>) {
     let mut overlays: HashMap<isize, isize> = HashMap::new();
     let mut animations: HashMap<isize, Animation> = HashMap::new();
+    let mut blur: Option<BlurSurface> = None;
+    let mut blur_job: Option<Receiver<Option<BlurSnapshot>>> = None;
 
     loop {
         let command = if animations.is_empty() {
             ANIMATION_RUNNING.store(false);
+
+            // the blur snapshot is taken on its own thread and uploaded here while idle,
+            // so no animation is using the surface while it changes
+            if let Some(job) = &blur_job
+                && let Ok(snapshot) = job.try_recv()
+            {
+                blur_job = None;
+                if let Some(snapshot) = snapshot {
+                    if blur.is_none() {
+                        blur = BlurSurface::new();
+                    }
+                    if let Some(blur) = &mut blur {
+                        blur.upload(&snapshot);
+                    }
+                }
+            }
+
+            let config = CONFIG.lock().clone();
+            let blur_due = blur.as_ref().is_none_or(|blur| blur.taken.elapsed() > BLUR_MAX_AGE);
+            if config.backdrop_blur.unwrap_or(true) && blur_due && blur_job.is_none() {
+                let radius = config.backdrop_blur_radius.unwrap_or(40);
+                let (sender, receiver) = crossbeam_channel::bounded(1);
+                std::thread::spawn(move || {
+                    let _ = sender.send(BlurSnapshot::capture(radius));
+                });
+                blur_job = Some(receiver);
+            }
+
             match receiver.recv_timeout(Duration::from_millis(100)) {
                 Ok(command) => Some(command),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
@@ -598,7 +1002,7 @@ fn run(receiver: Receiver<Command>) {
             };
 
             if let Some(overlay) = overlay {
-                let animation = Animation::start(&command, overlay);
+                let animation = Animation::start(&command, overlay, blur.as_ref());
                 // make sure the overlay has been composited before the real switch happens
                 let _ = unsafe { DwmFlush() };
                 animations.insert(command.hmonitor, animation);
