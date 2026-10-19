@@ -66,7 +66,9 @@ use windows::Win32::Graphics::Dwm::DWM_TNP_RECTDESTINATION;
 use windows::Win32::Graphics::Dwm::DWM_TNP_RECTSOURCE;
 use windows::Win32::Graphics::Dwm::DWM_TNP_SOURCECLIENTAREAONLY;
 use windows::Win32::Graphics::Dwm::DWM_TNP_VISIBLE;
+use windows::Win32::Graphics::Dwm::DWMWA_EXTENDED_FRAME_BOUNDS;
 use windows::Win32::Graphics::Dwm::DwmFlush;
+use windows::Win32::Graphics::Dwm::DwmGetWindowAttribute;
 use windows::Win32::Graphics::Dwm::DwmRegisterThumbnail;
 use windows::Win32::Graphics::Dwm::DwmUnregisterThumbnail;
 use windows::Win32::Graphics::Dwm::DwmUpdateThumbnailProperties;
@@ -105,6 +107,12 @@ const OVERLAY_READY_TIMEOUT: Duration = Duration::from_millis(60);
 /// The wallpaper snapshot is shrunk by this factor before being blurred; DWM upscales
 /// thumbnails with a coarse filter, so larger factors make the blur visibly blocky
 const BLUR_DOWNSCALE: i32 = 2;
+/// The system acrylic (as used by Zed's "blurred" background, ACCENT_ENABLE_ACRYLICBLURBEHIND
+/// with a transparent tint) measured against the plain wallpaper on 2026-10-20: a gaussian
+/// blur of ~30px, then per channel `0.83 * blurred + 7`, ie. ~17% of a dark grey mixed in
+const ACRYLIC_GAIN: [f64; 3] = [0.829, 0.828, 0.839];
+const ACRYLIC_OFFSET: [f64; 3] = [6.8, 7.3, 6.2];
+
 /// How often the blurred wallpaper snapshot is retaken. Taking it makes live wallpaper
 /// engines render, so it is kept rare; the blur hides how old the snapshot is.
 const BLUR_MAX_AGE: Duration = Duration::from_secs(600);
@@ -159,9 +167,12 @@ pub struct WorkspaceAnimationConfig {
     /// acrylic or mica backdrops don't turn see-through while they move (default: true)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backdrop_blur: Option<bool>,
-    /// Blur radius in pixels of the backdrop (default: 40)
+    /// Blur strength (gaussian sigma) in pixels of the backdrop (default: 30, like system acrylic)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backdrop_blur_radius: Option<u32>,
+    /// Focus border drawn around the focused window during the animation (default: none)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub border: Option<WorkspaceAnimationBorder>,
 }
 
 lazy_static! {
@@ -221,6 +232,17 @@ pub fn workspace_shown(
         .get(shown_idx)
         .map(visible_windows)
         .unwrap_or_default();
+    let focused = [previous_idx, shown_idx].map(|idx| {
+        workspaces.get(idx).and_then(|workspace| {
+            workspace
+                .monocle_container
+                .as_ref()
+                .and_then(|c| c.focused_window())
+                .or(workspace.maximized_window.as_ref())
+                .or_else(|| workspace.focused_container().and_then(|c| c.focused_window()))
+                .map(|window| window.hwnd)
+        })
+    });
 
     if outgoing.is_empty() && incoming.is_empty() {
         return;
@@ -233,6 +255,7 @@ pub fn workspace_shown(
         outgoing,
         incoming,
         forward: shown_idx > previous_idx,
+        focused,
         ack: ack_sender,
     };
 
@@ -275,6 +298,8 @@ struct Command {
     outgoing: Vec<isize>,
     incoming: Vec<isize>,
     forward: bool,
+    /// The focused windows of the outgoing and the incoming workspace
+    focused: [Option<isize>; 2],
     ack: Sender<()>,
 }
 
@@ -288,6 +313,15 @@ struct Thumbnail {
     start_rect: RECT,
 }
 
+/// A copy of a thumbnail's fields, so that rendering can update borders while iterating
+struct ThumbnailView {
+    id: isize,
+    hwnd: isize,
+    incoming: bool,
+    blur_patch: Option<isize>,
+    start_rect: RECT,
+}
+
 struct Animation {
     overlay: isize,
     work_area: Rect,
@@ -295,10 +329,13 @@ struct Animation {
     thumbnails: Vec<Thumbnail>,
     /// Desktop rect and pixel size of the blur snapshot the patches are cut from
     blur: Option<(RECT, i32, i32)>,
+    /// Focus borders: thumbnail, surface, and whether it belongs to the incoming workspace
+    borders: Vec<(isize, BlurSurface, bool)>,
     forward: bool,
     kind: WorkspaceAnimationKind,
     started: Instant,
     duration: Duration,
+    focused: [Option<isize>; 2],
 }
 
 fn animator() -> &'static Sender<Command> {
@@ -361,6 +398,22 @@ fn pump_messages() {
             DispatchMessageW(&msg);
         }
     }
+}
+
+/// The visible bounds of a window, without the invisible resize borders. Window thumbnails
+/// only contain this part of the window, so they have to be placed on it to render 1:1.
+fn frame_rect(hwnd: isize) -> Option<RECT> {
+    let mut rect = RECT::default();
+    unsafe {
+        DwmGetWindowAttribute(
+            HWND(hwnd as _),
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            (&raw mut rect).cast(),
+            std::mem::size_of::<RECT>() as u32,
+        )
+    }
+    .ok()?;
+    Some(rect)
 }
 
 fn raw_window_rect(hwnd: isize) -> Option<RECT> {
@@ -609,14 +662,24 @@ impl BlurSnapshot {
             ReleaseDC(None, screen);
         }
 
-        let radius = (radius as i32 / BLUR_DOWNSCALE).max(1) as usize;
-        // three box blur passes of radius r approximate a gaussian of radius ~r * 1.7
+        // three box blur passes of radius r make a gaussian with sigma^2 = ((2r+1)^2 - 1) / 4
+        let sigma = f64::from(radius) / f64::from(BLUR_DOWNSCALE);
+        let box_radius = (((4.0 * sigma * sigma + 1.0).sqrt() - 1.0) / 2.0).round().max(1.0);
         box_blur(
             &mut pixels,
             small_w as usize,
             small_h as usize,
-            (radius as f64 / 1.7).round().max(1.0) as usize,
+            box_radius as usize,
         );
+
+        // the luminosity layer of the system acrylic
+        for pixel in &mut pixels {
+            let channel = |shift: u32, c: usize| {
+                let value = f64::from((*pixel >> shift) & 0xff);
+                ((value * ACRYLIC_GAIN[c] + ACRYLIC_OFFSET[c]).round().clamp(0.0, 255.0)) as u32
+            };
+            *pixel = 0xff00_0000 | channel(16, 0) << 16 | channel(8, 1) << 8 | channel(0, 2);
+        }
 
         Some(Self {
             desktop,
@@ -627,7 +690,8 @@ impl BlurSnapshot {
     }
 }
 
-/// An off-screen layered window holding the blur snapshot, used as a thumbnail source
+/// An off-screen layered window holding a bitmap (the blur snapshot or a focus border),
+/// used as a thumbnail source
 struct BlurSurface {
     hwnd: isize,
     desktop: RECT,
@@ -676,7 +740,17 @@ impl BlurSurface {
     }
 
     fn upload(&mut self, snapshot: &BlurSnapshot) {
-        let (width, height) = (snapshot.width, snapshot.height);
+        self.upload_pixels(snapshot.width, snapshot.height, &snapshot.pixels);
+        self.desktop = snapshot.desktop;
+        self.taken = Instant::now();
+    }
+
+    /// Uploads premultiplied BGRA pixels
+    fn upload_pixels(&mut self, width: i32, height: i32, pixels: &[u32]) {
+        if width <= 0 || height <= 0 || pixels.len() != (width * height) as usize {
+            return;
+        }
+
         unsafe {
             let screen = GetDC(None);
             let memory = CreateCompatibleDC(Some(screen));
@@ -689,11 +763,7 @@ impl BlurSurface {
                 None,
                 0,
             ) {
-                std::ptr::copy_nonoverlapping(
-                    snapshot.pixels.as_ptr(),
-                    bits.cast::<u32>(),
-                    snapshot.pixels.len(),
-                );
+                std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast::<u32>(), pixels.len());
                 let previous = SelectObject(memory, bitmap.into());
                 let blend = BLENDFUNCTION {
                     BlendOp: AC_SRC_OVER as u8,
@@ -728,15 +798,103 @@ impl BlurSurface {
             ReleaseDC(None, screen);
         }
 
-        self.desktop = snapshot.desktop;
         self.width = width;
         self.height = height;
-        self.taken = Instant::now();
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+/// A focus border drawn around the focused window while a workspace switch animates, so that
+/// the focus highlight (eg. from komorebi or tacky-borders) doesn't disappear and pop back in
+pub struct WorkspaceAnimationBorder {
+    /// Border width in pixels (default: 3)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+    /// Border offset from the window edge in pixels, negative values move it inwards (default: -1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<f64>,
+    /// Corner radius of the window in pixels (default: 8)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f64>,
+    /// Border colour as #RRGGBB or #RRGGBBAA (default: #FFFFFFFF)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub colour: Option<String>,
+}
+
+fn parse_colour(colour: &str) -> (u8, u8, u8, u8) {
+    let hex = colour.trim_start_matches('#');
+    let channel = |idx: usize| {
+        hex.get(idx..idx + 2)
+            .and_then(|c| u8::from_str_radix(c, 16).ok())
+    };
+
+    match hex.len() {
+        6 | 8 => (
+            channel(0).unwrap_or(255),
+            channel(2).unwrap_or(255),
+            channel(4).unwrap_or(255),
+            channel(6).unwrap_or(255),
+        ),
+        _ => (255, 255, 255, 255),
+    }
+}
+
+/// Like tacky-borders, the outer edge of the border sits (width + offset) pixels outside of
+/// the visible frame of the window
+fn border_expansion(border: &WorkspaceAnimationBorder) -> i32 {
+    (border.width.unwrap_or(3.0) + border.offset.unwrap_or(-1.0)).round() as i32
+}
+
+/// Rasterises an anti-aliased rounded rectangle outline, whose outer edge is the edge of
+/// the bitmap, into premultiplied BGRA pixels
+fn render_border(width: i32, height: i32, border: &WorkspaceAnimationBorder) -> Vec<u32> {
+    let stroke = border.width.unwrap_or(3.0).max(0.5);
+    let radius = (border.radius.unwrap_or(8.0) + f64::from(border_expansion(border))).max(0.0);
+    let (r, g, b, a) = parse_colour(border.colour.as_deref().unwrap_or("#FFFFFFFF"));
+
+    let (w, h) = (f64::from(width), f64::from(height));
+    let (half_w, half_h) = (w / 2.0, h / 2.0);
+    let mut pixels = vec![0u32; (width * height) as usize];
+
+    // pixels further than this from every edge can't be touched by the stroke
+    let reach = (stroke + radius + 1.0).ceil() as i32;
+
+    for y in 0..height {
+        let near_y = y < reach || y >= height - reach;
+        for x in 0..width {
+            if !near_y && x >= reach && x < width - reach {
+                continue;
+            }
+
+            let px = (f64::from(x) + 0.5 - half_w).abs() - (half_w - radius);
+            let py = (f64::from(y) + 0.5 - half_h).abs() - (half_h - radius);
+            let distance = px.max(0.0).hypot(py.max(0.0)) + px.max(py).min(0.0) - radius;
+
+            let coverage =
+                (0.5 - distance).clamp(0.0, 1.0) * (0.5 + distance + stroke).clamp(0.0, 1.0);
+
+            if coverage > 0.0 {
+                let alpha = coverage * f64::from(a) / 255.0;
+                let premultiply = |c: u8| (f64::from(c) * alpha).round() as u32;
+                pixels[(y * width + x) as usize] = ((alpha * 255.0).round() as u32) << 24
+                    | premultiply(r) << 16
+                    | premultiply(g) << 8
+                    | premultiply(b);
+            }
+        }
+    }
+
+    pixels
+}
+
 impl Animation {
-    fn start(command: &Command, overlay: isize, blur: Option<&BlurSurface>) -> Self {
+    fn start(
+        command: &Command,
+        overlay: isize,
+        blur: Option<&BlurSurface>,
+        border_surfaces: &mut Vec<BlurSurface>,
+    ) -> Self {
         let config = CONFIG.lock().clone();
         let duration = config.duration.unwrap_or_else(|| {
             ANIMATION_DURATION_PER_ANIMATION
@@ -785,22 +943,41 @@ impl Animation {
                         hwnd,
                         blur_patch,
                         incoming: is_incoming,
-                        start_rect: raw_window_rect(hwnd).unwrap_or_default(),
+                        start_rect: frame_rect(hwnd)
+                            .or_else(|| raw_window_rect(hwnd))
+                            .unwrap_or_default(),
                     });
                 }
             }
         }
 
-        let animation = Self {
+        // borders are registered last so that they are drawn on top of every window
+        let mut borders = vec![];
+        if config.border.is_some() {
+            for (incoming, focused) in [(false, command.focused[0]), (true, command.focused[1])] {
+                if focused.is_some_and(|f| thumbnails.iter().any(|t| t.hwnd == f))
+                    && let Some(surface) = border_surfaces.pop().or_else(BlurSurface::new)
+                {
+                    match register(overlay, surface.hwnd) {
+                        Some(id) => borders.push((id, surface, incoming)),
+                        None => border_surfaces.push(surface),
+                    }
+                }
+            }
+        }
+
+        let mut animation = Self {
             overlay,
             work_area: wa,
             wallpaper,
             thumbnails,
+            borders,
             blur: blur.map(|blur| (blur.desktop, blur.width, blur.height)),
             forward: command.forward,
             kind: config.kind.unwrap_or_default(),
             started: Instant::now(),
             duration: Duration::from_millis(duration.max(1)),
+            focused: command.focused,
         };
 
         animation.render(0.0);
@@ -825,10 +1002,11 @@ impl Animation {
         apply_ease_func(progress, style)
     }
 
-    fn render(&self, progress: f64) {
+    fn render(&mut self, progress: f64) {
         let wa = self.work_area;
         let eased = Self::eased(progress);
         let slide_fade_distance = CONFIG.lock().slide_fade_distance.unwrap_or(0.2);
+        let config_border = CONFIG.lock().border.clone();
 
         // the wallpaper part of the desktop window which sits behind the work area
         if let Some(wallpaper) = self.wallpaper {
@@ -864,11 +1042,26 @@ impl Animation {
         let extent = f64::from(if vertical { wa.bottom } else { wa.right }) * distance;
         let direction = if self.forward { -1.0 } else { 1.0 };
 
-        for thumbnail in &self.thumbnails {
+        for idx in 0..self.thumbnails.len() {
+            let thumbnail = &self.thumbnails[idx];
+            let (thumbnail_id, thumbnail_hwnd, thumbnail_incoming, thumbnail_patch, start_rect) = (
+                thumbnail.id,
+                thumbnail.hwnd,
+                thumbnail.incoming,
+                thumbnail.blur_patch,
+                thumbnail.start_rect,
+            );
+            let thumbnail = ThumbnailView {
+                id: thumbnail_id,
+                hwnd: thumbnail_hwnd,
+                incoming: thumbnail_incoming,
+                blur_patch: thumbnail_patch,
+                start_rect,
+            };
             // incoming windows track their live position, so that the thumbnails always
             // land exactly where the real windows have been laid out
             let rect = if thumbnail.incoming {
-                raw_window_rect(thumbnail.hwnd).unwrap_or(thumbnail.start_rect)
+                frame_rect(thumbnail.hwnd).unwrap_or(thumbnail.start_rect)
             } else {
                 thumbnail.start_rect
             };
@@ -901,6 +1094,29 @@ impl Animation {
 
             update(thumbnail.id, destination, None, opacity);
 
+            if let Some(border) = &config_border {
+                let side = usize::from(thumbnail.incoming);
+                if self.focused[side] == Some(thumbnail.hwnd)
+                    && let Some((id, surface, _)) =
+                        self.borders.iter_mut().find(|(_, _, incoming)| *incoming == thumbnail.incoming)
+                {
+                    let expand = border_expansion(border);
+                    let rect = RECT {
+                        left: destination.left - expand,
+                        top: destination.top - expand,
+                        right: destination.right + expand,
+                        bottom: destination.bottom + expand,
+                    };
+                    let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+                    if width > 0 && height > 0 {
+                        if surface.width != width || surface.height != height {
+                            surface.upload_pixels(width, height, &render_border(width, height, border));
+                        }
+                        update(*id, rect, None, opacity);
+                    }
+                }
+            }
+
             // the blurred wallpaper which is behind the window at its current position
             if let (Some(patch), Some((desktop, width, height))) = (thumbnail.blur_patch, self.blur)
             {
@@ -919,7 +1135,12 @@ impl Animation {
         }
     }
 
-    fn finish(self, hide_overlay: bool) {
+    fn finish(self, hide_overlay: bool, border_surfaces: &mut Vec<BlurSurface>) {
+        for (id, surface, _) in self.borders {
+            let _ = unsafe { DwmUnregisterThumbnail(id) };
+            border_surfaces.push(surface);
+        }
+
         for thumbnail in &self.thumbnails {
             let _ = unsafe { DwmUnregisterThumbnail(thumbnail.id) };
             if let Some(patch) = thumbnail.blur_patch {
@@ -943,6 +1164,7 @@ fn run(receiver: Receiver<Command>) {
     let mut overlays: HashMap<isize, isize> = HashMap::new();
     let mut animations: HashMap<isize, Animation> = HashMap::new();
     let mut blur: Option<BlurSurface> = None;
+    let mut border_surfaces: Vec<BlurSurface> = vec![];
     let mut blur_job: Option<Receiver<Option<BlurSnapshot>>> = None;
 
     loop {
@@ -968,7 +1190,7 @@ fn run(receiver: Receiver<Command>) {
             let config = CONFIG.lock().clone();
             let blur_due = blur.as_ref().is_none_or(|blur| blur.taken.elapsed() > BLUR_MAX_AGE);
             if config.backdrop_blur.unwrap_or(true) && blur_due && blur_job.is_none() {
-                let radius = config.backdrop_blur_radius.unwrap_or(40);
+                let radius = config.backdrop_blur_radius.unwrap_or(30);
                 let (sender, receiver) = crossbeam_channel::bounded(1);
                 std::thread::spawn(move || {
                     let _ = sender.send(BlurSnapshot::capture(radius));
@@ -991,7 +1213,7 @@ fn run(receiver: Receiver<Command>) {
             // a new switch on a monitor which is still animating replaces that animation;
             // the overlay stays up so there is no flash of the real windows in between
             if let Some(previous) = animations.remove(&command.hmonitor) {
-                previous.finish(false);
+                previous.finish(false, &mut border_surfaces);
             }
 
             let overlay = match overlays.get(&command.hmonitor) {
@@ -1002,7 +1224,8 @@ fn run(receiver: Receiver<Command>) {
             };
 
             if let Some(overlay) = overlay {
-                let animation = Animation::start(&command, overlay, blur.as_ref());
+                let animation =
+                    Animation::start(&command, overlay, blur.as_ref(), &mut border_surfaces);
                 // make sure the overlay has been composited before the real switch happens
                 let _ = unsafe { DwmFlush() };
                 animations.insert(command.hmonitor, animation);
@@ -1014,7 +1237,7 @@ fn run(receiver: Receiver<Command>) {
         }
 
         let mut finished = vec![];
-        for (hmonitor, animation) in &animations {
+        for (hmonitor, animation) in &mut animations {
             let progress = animation.progress();
             animation.render(progress);
             if progress >= 1.0 {
@@ -1030,7 +1253,7 @@ fn run(receiver: Receiver<Command>) {
 
         for hmonitor in finished {
             if let Some(animation) = animations.remove(&hmonitor) {
-                animation.finish(true);
+                animation.finish(true, &mut border_surfaces);
             }
         }
 
