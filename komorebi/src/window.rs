@@ -453,8 +453,9 @@ impl Window {
         let animation_enabled = ANIMATION_ENABLED_PER_ANIMATION.lock();
         let move_enabled = animation_enabled.get(&MovementRenderDispatcher::PREFIX);
 
-        if move_enabled.is_some_and(|enabled| *enabled)
-            || ANIMATION_ENABLED_GLOBAL.load(Ordering::SeqCst)
+        if (move_enabled.is_some_and(|enabled| *enabled)
+            || ANIMATION_ENABLED_GLOBAL.load(Ordering::SeqCst))
+            && !crate::animation::movement_animations_suppressed()
         {
             let duration = Duration::from_millis(
                 *ANIMATION_DURATION_PER_ANIMATION

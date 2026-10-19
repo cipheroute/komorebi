@@ -168,8 +168,17 @@ impl Monitor {
     }
 
     pub fn load_focused_workspace(&mut self, mouse_follows_focus: bool) -> eyre::Result<()> {
+        crate::animation::suppress_movement_animations_after_workspace_switch();
+
         let focused_idx = self.focused_workspace_idx();
         let hmonitor = self.id;
+        crate::animation::workspace::workspace_shown(
+            hmonitor,
+            self.work_area_size,
+            self.workspaces(),
+            focused_idx,
+        );
+
         let monitor_wp = self.wallpaper.clone();
         for (i, workspace) in self.workspaces_mut().iter_mut().enumerate() {
             if i == focused_idx {

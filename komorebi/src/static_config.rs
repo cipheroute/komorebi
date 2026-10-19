@@ -695,6 +695,9 @@ pub struct AnimationsConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(extend("default" = ANIMATION_FPS)))]
     pub fps: Option<u64>,
+    /// Workspace switch animation options
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<crate::animation::workspace::WorkspaceAnimationConfig>,
 }
 
 pub use komorebi_themes::KomorebiTheme;
@@ -1022,6 +1025,8 @@ impl StaticConfig {
                 animations.fps.unwrap_or(DEFAULT_ANIMATION_FPS),
                 Ordering::SeqCst,
             );
+
+            crate::animation::workspace::set_config(animations.workspace.clone());
         }
 
         if let Some(container) = self.default_container_padding {

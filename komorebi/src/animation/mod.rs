@@ -18,6 +18,7 @@ pub mod prefix;
 pub mod render_dispatcher;
 pub use render_dispatcher::RenderDispatcher;
 pub mod style;
+pub mod workspace;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -78,3 +79,29 @@ lazy_static! {
 }
 
 pub static ANIMATION_FPS: AtomicU64 = AtomicU64::new(DEFAULT_ANIMATION_FPS);
+
+/// How long movement animations stay suppressed after a workspace switch
+pub const WORKSPACE_SWITCH_ANIMATION_SUPPRESSION_MS: u64 = 400;
+
+static ANIMATION_SUPPRESSED_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// Windows are repositioned instantly (without movement animations) for a short
+/// while after a workspace switch, so that layout corrections which happen as the
+/// workspace is restored don't show up as windows visibly shrinking and growing
+pub fn suppress_movement_animations_after_workspace_switch() {
+    ANIMATION_SUPPRESSED_UNTIL_MS.store(
+        now_ms() + WORKSPACE_SWITCH_ANIMATION_SUPPRESSION_MS,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+pub fn movement_animations_suppressed() -> bool {
+    now_ms() < ANIMATION_SUPPRESSED_UNTIL_MS.load(std::sync::atomic::Ordering::SeqCst)
+}

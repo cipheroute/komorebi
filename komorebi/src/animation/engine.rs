@@ -43,7 +43,7 @@ impl AnimationEngine {
                 ANIMATION_MANAGER.lock().end(animation_key);
             }
 
-            std::thread::sleep(Duration::from_millis(250 / 2));
+            std::thread::sleep(Duration::from_millis(2));
         }
 
         let latest_cancel_idx = ANIMATION_MANAGER.lock().latest_cancel_idx(animation_key);
@@ -51,6 +51,32 @@ impl AnimationEngine {
         ANIMATION_MANAGER.lock().end_cancel(animation_key);
 
         latest_cancel_idx == cancel_idx
+    }
+
+    /// Waits for the next DWM composition frame instead of sleeping, so that every
+    /// animation step lands on a display refresh and all concurrently animated windows
+    /// move on the same frame. `std::thread::sleep` on Windows has a coarse resolution
+    /// (often ~15ms), which made animations step unevenly regardless of the fps setting.
+    fn wait_for_next_frame(frame_start: Instant, target_frame_time: Duration) {
+        // leave a little headroom so that a refresh rate matching the fps setting
+        // doesn't skip every other frame
+        let min_frame_time = target_frame_time.saturating_sub(Duration::from_millis(1));
+
+        loop {
+            // SAFETY: DwmFlush takes no arguments and only blocks the calling thread
+            if unsafe { windows::Win32::Graphics::Dwm::DwmFlush() }.is_err() {
+                let elapsed = frame_start.elapsed();
+                if elapsed < target_frame_time {
+                    std::thread::sleep(target_frame_time - elapsed);
+                }
+
+                return;
+            }
+
+            if frame_start.elapsed() >= min_frame_time {
+                return;
+            }
+        }
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -95,12 +121,7 @@ impl AnimationEngine {
                     animation_start.elapsed().as_millis() as f64 / duration.as_millis() as f64;
                 render_dispatcher.render(progress).ok();
 
-                // sleep until next frame
-                let frame_time_elapsed = frame_start.elapsed();
-
-                if frame_time_elapsed < target_frame_time {
-                    std::thread::sleep(target_frame_time - frame_time_elapsed);
-                }
+                Self::wait_for_next_frame(frame_start, target_frame_time);
             }
 
             ANIMATION_MANAGER.lock().end(animation_key.as_str());
