@@ -81,6 +81,12 @@ use windows::Win32::UI::WindowsAndMessaging::GetTopWindow;
 use windows::Win32::UI::WindowsAndMessaging::GetWindow;
 use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 use windows::Win32::UI::WindowsAndMessaging::HWND_TOPMOST;
+use windows::Win32::UI::WindowsAndMessaging::IsIconic;
+use windows::Win32::UI::WindowsAndMessaging::SC_MINIMIZE;
+use windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE;
+use windows::Win32::UI::WindowsAndMessaging::WINDOWPOS;
+use windows::Win32::UI::WindowsAndMessaging::WM_SYSCOMMAND;
+use windows::Win32::UI::WindowsAndMessaging::WM_WINDOWPOSCHANGING;
 use windows::Win32::UI::WindowsAndMessaging::MSG;
 use windows::Win32::UI::WindowsAndMessaging::PM_REMOVE;
 use windows::Win32::UI::WindowsAndMessaging::PeekMessageW;
@@ -353,6 +359,29 @@ extern "system" fn overlay_callback(
     lparam: LPARAM,
 ) -> LRESULT {
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+/// Off-screen thumbnail sources must stay off-screen: "minimise all" (Win+D, Win+M)
+/// otherwise parks them in the minimised row above the taskbar where they are visible
+extern "system" fn surface_callback(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match message {
+        WM_SYSCOMMAND if (wparam.0 & 0xFFF0) as u32 == SC_MINIMIZE => LRESULT(0),
+        WM_WINDOWPOSCHANGING => {
+            if let Some(pos) = unsafe { (lparam.0 as *mut WINDOWPOS).as_mut() }
+                && !pos.flags.contains(SWP_NOMOVE)
+            {
+                pos.x = OFFSCREEN;
+                pos.y = OFFSCREEN;
+            }
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+    }
 }
 
 fn create_overlay() -> Option<isize> {
@@ -707,7 +736,7 @@ impl BlurSurface {
         let window_class = WNDCLASSW {
             hInstance: h_module.into(),
             lpszClassName: class_name,
-            lpfnWndProc: Some(overlay_callback),
+            lpfnWndProc: Some(surface_callback),
             ..Default::default()
         };
         let _ = WindowsApi::register_class_w(&window_class);
@@ -737,6 +766,15 @@ impl BlurSurface {
             height: 0,
             taken: Instant::now(),
         })
+    }
+
+    /// A minimised source gives an empty thumbnail, so restore it if something minimised it
+    fn ensure_restored(&self) {
+        unsafe {
+            if IsIconic(HWND(self.hwnd as _)).as_bool() {
+                let _ = ShowWindow(HWND(self.hwnd as _), SW_SHOWNOACTIVATE);
+            }
+        }
     }
 
     fn upload(&mut self, snapshot: &BlurSnapshot) {
@@ -930,6 +968,9 @@ impl Animation {
             WorkspaceAnimationKind::Slide | WorkspaceAnimationKind::SlideVertical
         );
         let blur = blur.filter(|_| !fades);
+        if let Some(blur) = blur {
+            blur.ensure_restored();
+        }
 
         let mut thumbnails = vec![];
         for (hwnds, is_incoming) in [(outgoing, false), (incoming, true)] {
@@ -958,6 +999,7 @@ impl Animation {
                 if focused.is_some_and(|f| thumbnails.iter().any(|t| t.hwnd == f))
                     && let Some(surface) = border_surfaces.pop().or_else(BlurSurface::new)
                 {
+                    surface.ensure_restored();
                     match register(overlay, surface.hwnd) {
                         Some(id) => borders.push((id, surface, incoming)),
                         None => border_surfaces.push(surface),
