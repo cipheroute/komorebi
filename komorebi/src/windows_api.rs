@@ -483,6 +483,34 @@ impl WindowsApi {
         top: bool,
         with_async_window_pos: bool,
     ) -> eyre::Result<()> {
+        // By default SetWindowPos waits for target window's WindowProc thread
+        // to process the message, so we have to use ASYNC_WINDOW_POS to avoid
+        // blocking our thread in case the target window is not responding.
+        let async_window_pos = with_async_window_pos
+            && matches!(
+                WINDOW_HANDLING_BEHAVIOUR.load(),
+                WindowHandlingBehaviour::Async
+            );
+
+        Self::position_window_with(hwnd, layout, top, async_window_pos)
+    }
+
+    /// Like position_window, but never waits for the window to process the move. Used while
+    /// an animation overlay hides the real windows, which then don't have to be waited on.
+    pub fn position_window_without_waiting(
+        hwnd: isize,
+        layout: &Rect,
+        top: bool,
+    ) -> eyre::Result<()> {
+        Self::position_window_with(hwnd, layout, top, true)
+    }
+
+    fn position_window_with(
+        hwnd: isize,
+        layout: &Rect,
+        top: bool,
+        async_window_pos: bool,
+    ) -> eyre::Result<()> {
         let hwnd = HWND(as_ptr!(hwnd));
 
         let mut flags = SetWindowPosition::NO_ACTIVATE
@@ -494,15 +522,7 @@ impl WindowsApi {
         // effect, otherwise pass NO_Z_ORDER that will cause set_window_pos to
         // ignore the z-order paramter.
 
-        // By default SetWindowPos waits for target window's WindowProc thread
-        // to process the message, so we have to use ASYNC_WINDOW_POS to avoid
-        // blocking our thread in case the target window is not responding.
-        if with_async_window_pos
-            && matches!(
-                WINDOW_HANDLING_BEHAVIOUR.load(),
-                WindowHandlingBehaviour::Async
-            )
-        {
+        if async_window_pos {
             flags |= SetWindowPosition::ASYNC_WINDOW_POS;
         }
 

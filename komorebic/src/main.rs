@@ -1035,6 +1035,10 @@ enum SubCommand {
     Docgen(Docgen),
     #[clap(hide = true)]
     Splash(Splash),
+    /// Read komorebic commands line by line from stdin and run them in this one process, so
+    /// that hotkey daemons don't pay for a process start on every key press
+    #[clap(hide = true)]
+    Session,
     /// Gather example configurations for a new-user quickstart
     Quickstart,
     /// Specify an email associated with an Individual Commercial Use License
@@ -1596,11 +1600,74 @@ fn startup_dir() -> eyre::Result<PathBuf> {
     Ok(startup)
 }
 
-#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 fn main() -> eyre::Result<()> {
-    let opts: Opts = Opts::parse();
+    run(Opts::parse())
+}
 
+/// Splits a command line on whitespace, keeping double quoted parts together
+fn split_command_line(line: &str) -> Vec<String> {
+    let mut words = vec![];
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut has_word = false;
+
+    for c in line.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                has_word = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if has_word {
+                    words.push(std::mem::take(&mut current));
+                    has_word = false;
+                }
+            }
+            c => {
+                current.push(c);
+                has_word = true;
+            }
+        }
+    }
+
+    if has_word {
+        words.push(current);
+    }
+
+    words
+}
+
+fn session() {
+    use std::io::BufRead;
+
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else {
+            break;
+        };
+
+        let mut words = split_command_line(&line);
+        if words.first().is_some_and(|w| w.eq_ignore_ascii_case("komorebic")) {
+            words.remove(0);
+        }
+        if words.is_empty() {
+            continue;
+        }
+
+        match Opts::try_parse_from(std::iter::once("komorebic".to_string()).chain(words)) {
+            Ok(opts) => {
+                if let Err(error) = run(opts) {
+                    eprintln!("{error:?}");
+                }
+            }
+            Err(error) => eprintln!("{error}"),
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+fn run(opts: Opts) -> eyre::Result<()> {
     match opts.subcmd {
+        SubCommand::Session => session(),
         SubCommand::Docgen(args) => {
             let mut cli = Opts::command();
             let subcommands = cli.get_subcommands_mut();

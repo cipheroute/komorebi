@@ -132,6 +132,13 @@ const ACRYLIC_OFFSET: [f64; 3] = [6.8, 7.3, 6.2];
 /// How often the blurred wallpaper snapshot is retaken. Taking it makes live wallpaper
 /// engines render, so it is kept rare; the blur hides how old the snapshot is.
 const BLUR_MAX_AGE: Duration = Duration::from_secs(600);
+/// Window animations place the real windows once this much of the animation has passed. With
+/// the usual ease-out curves the thumbnails are nearly at their targets by then, so swapping
+/// the stretched old content for the redrawn window is barely visible, and apps get the rest
+/// of the animation to redraw behind the overlay.
+const WINDOWS_PLACED_AT: f64 = 0.5;
+/// The least time placed windows get to redraw before the overlay is removed
+const WINDOWS_REDRAW_TIME: Duration = Duration::from_millis(50);
 /// Source windows for thumbnails of our own content live far outside of any monitor
 const OFFSCREEN: i32 = -20000;
 
@@ -213,6 +220,8 @@ lazy_static! {
     static ref WINDOW_CONFIG: Mutex<Option<WindowAnimationConfig>> = Mutex::new(None);
     /// Monitors (by hmonitor) on which a workspace switch is currently animating
     static ref SWITCHING_MONITORS: Mutex<HashSet<isize>> = Mutex::new(HashSet::new());
+    /// Monitors (by hmonitor) whose overlay is currently on screen
+    static ref COVERED_MONITORS: Mutex<HashSet<isize>> = Mutex::new(HashSet::new());
     /// The workspace index currently on screen for each monitor (by hmonitor)
     static ref SHOWN_WORKSPACES: Mutex<HashMap<isize, usize>> = Mutex::new(HashMap::new());
 }
@@ -244,10 +253,10 @@ fn window_animations_enabled() -> bool {
             .unwrap_or_else(|| ANIMATION_ENABLED_GLOBAL.load(Ordering::SeqCst))
 }
 
-/// Called by a workspace right before it moves its windows to `moves` (window, layout rect).
-/// Returns true when an overlay animation now covers the work area, in which case the caller
-/// must place the windows at their targets right away instead of animating them itself.
-pub fn windows_moving(workspace: &Workspace, moves: &[(isize, Rect)]) -> bool {
+/// Called by a workspace instead of moving its windows to `moves` (window, layout rect, raise).
+/// Returns true when an overlay animation now covers the work area; the animation then places
+/// the windows itself. Returns false when the caller has to place the windows.
+pub fn windows_moving(workspace: &Workspace, moves: &[(isize, Rect, bool)]) -> bool {
     if !window_animations_enabled() || crate::animation::movement_animations_suppressed() {
         return false;
     }
@@ -255,14 +264,6 @@ pub fn windows_moving(workspace: &Workspace, moves: &[(isize, Rect)]) -> bool {
     let shown = |hwnd: isize| {
         WindowsApi::is_window(hwnd) && !WindowsApi::is_window_cloaked(hwnd).unwrap_or(true)
     };
-
-    // hidden workspaces are laid out too; only the one on screen is animated
-    let changed = moves.iter().any(|(hwnd, target)| {
-        shown(*hwnd) && WindowsApi::window_rect(*hwnd).is_ok_and(|rect| rect != *target)
-    });
-    if !changed {
-        return false;
-    }
 
     let wa = workspace.globals.work_area;
     let hmonitor = WindowsApi::monitor_from_point(POINT {
@@ -275,10 +276,29 @@ pub fn windows_moving(workspace: &Workspace, moves: &[(isize, Rect)]) -> bool {
         return false;
     }
 
+    // hidden workspaces are laid out too; only the one on screen is animated. While an
+    // animation is running, its windows haven't been placed yet, so any change (even back to
+    // where the windows really are) has to go through it.
+    let changed = moves.iter().any(|(hwnd, target, _)| {
+        shown(*hwnd) && WindowsApi::window_rect(*hwnd).is_ok_and(|rect| rect != *target)
+    });
+    if !changed && !COVERED_MONITORS.lock().contains(&hmonitor) {
+        return false;
+    }
+
     let managed = visible_windows(workspace)
         .into_iter()
         .filter(|hwnd| shown(*hwnd))
         .collect::<Vec<_>>();
+
+    // windows which are not on the overlay (eg. the hidden windows of a stack) are placed now
+    for (hwnd, layout, top) in moves {
+        if !managed.contains(hwnd)
+            && WindowsApi::window_rect(*hwnd).is_ok_and(|rect| rect != *layout)
+        {
+            let _ = WindowsApi::position_window_without_waiting(*hwnd, layout, *top);
+        }
+    }
 
     // unmanaged windows on the monitor (eg. desktop pets, apps komorebi ignores) are put on
     // the overlay too, as they would otherwise vanish while it covers the work area
@@ -287,17 +307,15 @@ pub fn windows_moving(workspace: &Workspace, moves: &[(isize, Rect)]) -> bool {
         .map(|hwnd| (*hwnd, true))
         .chain(unmanaged_windows(wa, &managed).into_iter().map(|hwnd| (hwnd, false)))
         .filter_map(|(hwnd, managed)| {
-            let target = moves.iter().find(|(h, _)| *h == hwnd).map(|(_, layout)| RECT {
-                left: layout.left,
-                top: layout.top,
-                right: layout.left + layout.right,
-                bottom: layout.top + layout.bottom,
-            });
+            let layout = moves
+                .iter()
+                .find(|(h, _, _)| *h == hwnd)
+                .map(|(_, layout, top)| (*layout, *top));
 
             Some(WindowMove {
                 hwnd,
                 frame: frame_rect(hwnd).or_else(|| raw_window_rect(hwnd))?,
-                target,
+                layout,
                 managed,
             })
         })
@@ -323,9 +341,12 @@ pub fn windows_moving(workspace: &Workspace, moves: &[(isize, Rect)]) -> bool {
         return false;
     }
 
+    // when the overlay is already up from the previous change, there is nothing to wait for;
     // even if the overlay is late, the thumbnails track the live window positions, so the
     // windows still have to be placed directly
-    let _ = ack_receiver.recv_timeout(OVERLAY_READY_TIMEOUT);
+    if !COVERED_MONITORS.lock().contains(&hmonitor) {
+        let _ = ack_receiver.recv_timeout(OVERLAY_READY_TIMEOUT);
+    }
     true
 }
 
@@ -450,8 +471,8 @@ struct WindowMove {
     hwnd: isize,
     /// The visible frame before the move
     frame: RECT,
-    /// The visible frame komorebi lays the window out at, if it is being placed
-    target: Option<RECT>,
+    /// Where komorebi lays the window out, and whether it is raised, if it is being placed
+    layout: Option<(Rect, bool)>,
     /// Managed by the workspace, as opposed to some other window over the work area
     managed: bool,
 }
@@ -488,6 +509,8 @@ struct Thumbnail {
     /// with a minimum size really end up) after that.
     placed_from: RECT,
     target: Option<RECT>,
+    /// Window animations: where the real window still has to be placed (layout, raise)
+    layout: Option<(Rect, bool)>,
 }
 
 /// A copy of a thumbnail's fields, so that rendering can update borders while iterating
@@ -515,6 +538,8 @@ struct Animation {
     focused: [Option<isize>; 2],
     /// Moves and resizes windows in place instead of switching workspaces
     windows: bool,
+    /// When the real windows of a window animation were placed
+    placed: Option<Instant>,
 }
 
 fn animator() -> &'static Sender<Job> {
@@ -1230,6 +1255,7 @@ impl Animation {
                         current: start_rect,
                         placed_from: start_rect,
                         target: None,
+                        layout: None,
                     });
                 }
             }
@@ -1264,6 +1290,7 @@ impl Animation {
             duration: Duration::from_millis(duration.max(1)),
             focused: command.focused,
             windows: false,
+            placed: None,
         };
 
         animation.render(0.0);
@@ -1334,8 +1361,16 @@ impl Animation {
                     start_rect,
                     current: start_rect,
                     placed_from: window.frame,
-                    target: window.target,
+                    target: window.layout.map(|(layout, _)| RECT {
+                        left: layout.left,
+                        top: layout.top,
+                        right: layout.left + layout.right,
+                        bottom: layout.top + layout.bottom,
+                    }),
+                    layout: window.layout,
                 });
+            } else if let Some((layout, top)) = window.layout {
+                let _ = WindowsApi::position_window_without_waiting(hwnd, &layout, top);
             }
         }
 
@@ -1364,11 +1399,54 @@ impl Animation {
             duration: Duration::from_millis(duration.max(1)),
             focused: [None, command.focused],
             windows: true,
+            placed: None,
         };
 
         animation.render(0.0);
         show_overlay(overlay);
         animation
+    }
+
+    /// Places the real windows where the thumbnails are heading. Done once, near the end of
+    /// the animation, so that apps only redraw at their final size, behind the overlay.
+    fn place(&mut self) {
+        if self.placed.is_some() {
+            return;
+        }
+
+        for thumbnail in &mut self.thumbnails {
+            if let Some((layout, top)) = thumbnail.layout.take()
+                && WindowsApi::window_rect(thumbnail.hwnd).is_ok_and(|rect| rect != layout)
+            {
+                let _ = WindowsApi::position_window_without_waiting(thumbnail.hwnd, &layout, top);
+            }
+        }
+
+        self.placed = Some(Instant::now());
+    }
+
+    /// Places the windows of this animation which `next` doesn't place itself
+    fn place_unless_in(&mut self, next: &WindowsCommand) {
+        for thumbnail in &mut self.thumbnails {
+            if next.windows.iter().any(|w| w.hwnd == thumbnail.hwnd && w.layout.is_some()) {
+                thumbnail.layout = None;
+            }
+        }
+
+        self.place();
+    }
+
+    /// Whether a new window command would only repeat the placements of this animation
+    fn has_same_targets(&self, command: &WindowsCommand) -> bool {
+        self.windows
+            && self.placed.is_none()
+            && command.windows.iter().all(|window| match window.layout {
+                Some((layout, _)) => self
+                    .thumbnails
+                    .iter()
+                    .any(|t| t.hwnd == window.hwnd && t.layout.is_some_and(|(l, _)| l == layout)),
+                None => self.thumbnails.iter().any(|t| t.hwnd == window.hwnd),
+            })
     }
 
     fn progress(&self) -> f64 {
@@ -1657,9 +1735,23 @@ fn run(receiver: Receiver<Job>) {
                 }),
             };
 
+            // layout updates which only repeat the targets of the running animation (eg. from
+            // the focus events that follow a layout change) leave it running undisturbed
+            if let (Job::Windows(command), Some(running)) = (&job, &previous)
+                && running.has_same_targets(command)
+            {
+                if let Some(running) = previous.take() {
+                    animations.insert(hmonitor, running);
+                }
+                let _ = command.ack.send(());
+                pump_messages();
+                continue;
+            }
+
             let animation = overlay.map(|overlay| match &job {
                 Job::Workspace(command) => {
-                    if let Some(previous) = previous.take() {
+                    if let Some(mut previous) = previous.take() {
+                        previous.place();
                         previous.finish(false, &mut border_surfaces);
                     }
                     Animation::start(command, overlay, blur.as_ref(), &mut border_surfaces)
@@ -1673,7 +1765,11 @@ fn run(receiver: Receiver<Job>) {
                 ),
             });
 
-            if let Some(previous) = previous {
+            if let Some(mut previous) = previous {
+                match &job {
+                    Job::Windows(command) => previous.place_unless_in(command),
+                    Job::Workspace(_) => previous.place(),
+                }
                 previous.finish(false, &mut border_surfaces);
             }
 
@@ -1681,6 +1777,7 @@ fn run(receiver: Receiver<Job>) {
                 // make sure the overlay has been composited before the real windows change
                 let _ = unsafe { DwmFlush() };
                 animations.insert(hmonitor, animation);
+                COVERED_MONITORS.lock().insert(hmonitor);
             } else if matches!(job, Job::Workspace(_)) {
                 SWITCHING_MONITORS.lock().remove(&hmonitor);
             }
@@ -1697,7 +1794,16 @@ fn run(receiver: Receiver<Job>) {
         for (hmonitor, animation) in &mut animations {
             let progress = animation.progress();
             animation.render(progress);
-            if progress >= 1.0 {
+
+            if animation.windows && progress >= WINDOWS_PLACED_AT {
+                animation.place();
+            }
+
+            // placed windows get a moment to redraw at their new size before the overlay goes
+            let settled = animation
+                .placed
+                .is_none_or(|placed| placed.elapsed() >= WINDOWS_REDRAW_TIME);
+            if progress >= 1.0 && settled {
                 finished.push(*hmonitor);
             }
         }
@@ -1713,6 +1819,7 @@ fn run(receiver: Receiver<Job>) {
                 if !animation.windows {
                     SWITCHING_MONITORS.lock().remove(&hmonitor);
                 }
+                COVERED_MONITORS.lock().remove(&hmonitor);
                 animation.finish(true, &mut border_surfaces);
             }
         }

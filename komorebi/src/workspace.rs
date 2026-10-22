@@ -782,16 +782,12 @@ impl Workspace {
         if !moves.is_empty() {
             let targets = moves
                 .iter()
-                .map(|(window, rect, _)| (window.hwnd, *rect))
+                .map(|(window, rect, top)| (window.hwnd, *rect, *top))
                 .collect::<Vec<_>>();
 
-            if crate::animation::workspace::windows_moving(self, &targets) {
-                for (window, rect, top) in &moves {
-                    if WindowsApi::window_rect(window.hwnd).is_ok_and(|current| current != *rect) {
-                        WindowsApi::position_window(window.hwnd, rect, *top, true)?;
-                    }
-                }
-            } else {
+            // when animated, the overlay places the real windows itself, once, near the end of
+            // the animation, so that rapid layout changes don't make every app redraw each time
+            if !crate::animation::workspace::windows_moving(self, &targets) {
                 for (window, rect, top) in &moves {
                     window.set_position(rect, *top)?;
                 }
