@@ -1,3 +1,9 @@
+> [!NOTE]
+> **This is a personal fork with Hyprland-like animations, published as is.**
+> See [FORK.md](./FORK.md) for what it changes, its configuration and the demo video,
+> and [AGENTS.md](./AGENTS.md) for build and setup steps an AI coding agent can follow.
+> Everything below is the upstream komorebi README.
+
 # komorebi
 
 Tiling Window Management for Windows.
