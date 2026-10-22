@@ -94,6 +94,14 @@ impl WindowManager {
             return Ok(());
         }
 
+        if let WindowManagerEvent::Show(_, window) = event
+            && window.closes_at_app_start()
+        {
+            tracing::info!("closing {} as it opened itself at application start", window.hwnd);
+            let _ = window.close();
+            return Ok(());
+        }
+
         let mut rule_debug = RuleDebug::default();
 
         let should_manage = event.window().should_manage(Some(event), &mut rule_debug)?;

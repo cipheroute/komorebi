@@ -617,6 +617,10 @@ pub struct StaticConfig {
     /// Individual window force-manage rules
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manage_rules: Option<Vec<MatchingRule>>,
+    /// Windows which are closed when they appear shortly after their application started, eg.
+    /// a friends list which opens itself on every launch (it can still be opened later)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_at_app_start_rules: Option<Vec<MatchingRule>>,
     /// Identify applications which should be managed as floating windows
     #[serde(skip_serializing_if = "Option::is_none")]
     pub floating_applications: Option<Vec<MatchingRule>>,
@@ -929,6 +933,7 @@ impl From<&WindowManager> for StaticConfig {
             ignore_rules: None,
             floating_applications: None,
             manage_rules: None,
+            close_at_app_start_rules: None,
             border_overflow_applications: None,
             tray_and_multi_window_applications: None,
             layered_applications: None,
@@ -1142,6 +1147,11 @@ impl StaticConfig {
 
         if let Some(rules) = &mut self.manage_rules {
             populate_rules(rules, &mut manage_identifiers, &mut regex_identifiers)?;
+        }
+
+        if let Some(rules) = &mut self.close_at_app_start_rules {
+            let mut close_identifiers = crate::CLOSE_AT_APP_START_IDENTIFIERS.lock();
+            populate_rules(rules, &mut close_identifiers, &mut regex_identifiers)?;
         }
 
         if let Some(rules) = &mut self.object_name_change_applications {

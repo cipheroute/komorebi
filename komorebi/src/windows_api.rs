@@ -1032,6 +1032,31 @@ impl WindowsApi {
         Ok(String::from_utf16(&path[..len as usize])?)
     }
 
+    /// How long ago a process started
+    pub fn process_age(process_id: u32) -> Option<std::time::Duration> {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+        use windows::Win32::System::Threading::GetProcessTimes;
+
+        let handle = Self::open_process(
+            windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            process_id,
+        )
+        .ok()?;
+        let (mut created, mut exited, mut kernel, mut user) = Default::default();
+        let times = unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) };
+        let _ = Self::close_process(handle);
+        times.ok()?;
+
+        let now = unsafe { GetSystemTimeAsFileTime() };
+        let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+        // FILETIME counts 100ns intervals
+        Some(std::time::Duration::from_nanos(
+            ticks(now).saturating_sub(ticks(created)) * 100,
+        ))
+    }
+
     pub fn exe(handle: HANDLE) -> eyre::Result<String> {
         Ok(Self::exe_path(handle)?
             .split('\\')

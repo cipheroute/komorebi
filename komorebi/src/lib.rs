@@ -143,6 +143,8 @@ lazy_static! {
     static ref REGEX_IDENTIFIERS: Arc<Mutex<HashMap<String, Regex>>> =
         Arc::new(Mutex::new(HashMap::new()));
     static ref MANAGE_IDENTIFIERS: Arc<Mutex<Vec<MatchingRule>>> = Arc::new(Mutex::new(vec![]));
+    static ref CLOSE_AT_APP_START_IDENTIFIERS: Arc<Mutex<Vec<MatchingRule>>> =
+        Arc::new(Mutex::new(vec![]));
     static ref IGNORE_IDENTIFIERS: Arc<Mutex<Vec<MatchingRule>>> = Arc::new(Mutex::new(vec![
         // mstsc.exe creates these on Windows 11 when a WSL process is launched
         // https://github.com/LGUG2Z/komorebi/issues/74

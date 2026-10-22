@@ -727,6 +727,30 @@ impl Window {
         path
     }
 
+    /// Whether this window matches a `close_at_app_start_rules` rule and its process has only
+    /// just started, so that it opened itself rather than being opened by the user
+    pub fn closes_at_app_start(self) -> bool {
+        const APP_START: std::time::Duration = std::time::Duration::from_secs(40);
+
+        let rules = crate::CLOSE_AT_APP_START_IDENTIFIERS.lock();
+        if rules.is_empty() {
+            return false;
+        }
+
+        let (Ok(title), Ok(exe), Ok(class), Ok(path)) =
+            (self.title(), self.exe(), self.class(), self.path())
+        else {
+            return false;
+        };
+
+        let regex_identifiers = REGEX_IDENTIFIERS.lock();
+        if should_act(&title, &exe, &class, &path, &rules, &regex_identifiers).is_none() {
+            return false;
+        }
+
+        WindowsApi::process_age(self.process_id()).is_some_and(|age| age < APP_START)
+    }
+
     pub fn exe(self) -> eyre::Result<String> {
         let (process_id, _) = WindowsApi::window_thread_process_id(self.hwnd);
         let handle = WindowsApi::process_handle(process_id)?;
