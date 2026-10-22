@@ -204,7 +204,10 @@ impl RenderDispatcher for MovementRenderDispatcher {
 
         // we don't check WINDOW_HANDLING_BEHAVIOUR here because animations
         // are always run on a separate thread
-        WindowsApi::move_window(self.hwnd, &new_rect, false)?;
+        // Same call as the final placement in post_render: MoveWindow let apps with a minimum
+        // size (e.g. Happ) grow back over their neighbours on every frame and then snap at the
+        // end, and it skipped the shadow adjustment so every window jumped by its shadow width
+        WindowsApi::position_window(self.hwnd, &new_rect, false, false)?;
         WindowsApi::invalidate_rect(self.hwnd, None, false);
 
         Ok(())
