@@ -7,7 +7,9 @@
 
 Based on komorebi **v0.1.41**. All changes live on the `first-simple` branch.
 
-**Demo video:** [media/demo.mp4](./media/demo.mp4) (1080p, 120 fps, AV1)
+[![demo](./media/preview.webp)](./media/demo.mp4)
+
+*Click the preview for the full video (48 s, 1080p, 120 fps, AV1).*
 
 ## What it does
 
