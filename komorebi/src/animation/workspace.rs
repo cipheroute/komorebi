@@ -6,6 +6,11 @@
 //! are composited onto it by DWM on the GPU. Thumbnails keep rendering even for cloaked
 //! windows, so the real workspace switch happens instantly underneath the overlay, and
 //! the overlay is removed once the thumbnails have reached the real window positions.
+//!
+//! Window moves and resizes within a workspace use the same overlay: the real windows are
+//! placed at their new positions once, underneath it, and their thumbnails are stretched
+//! from the old rects to the new ones, so that applications don't have to redraw at every
+//! intermediate size.
 
 use crate::animation::ANIMATION_DURATION_GLOBAL;
 use crate::animation::ANIMATION_DURATION_PER_ANIMATION;
@@ -27,6 +32,7 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
@@ -77,6 +83,9 @@ use windows::Win32::UI::WindowsAndMessaging::DefWindowProcW;
 use windows::Win32::UI::WindowsAndMessaging::DispatchMessageW;
 use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
 use windows::Win32::UI::WindowsAndMessaging::GW_HWNDNEXT;
+use windows::Win32::UI::WindowsAndMessaging::GWL_EXSTYLE;
+use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+use windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW;
 use windows::Win32::UI::WindowsAndMessaging::GetTopWindow;
 use windows::Win32::UI::WindowsAndMessaging::GetWindow;
 use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
@@ -84,6 +93,7 @@ use windows::Win32::UI::WindowsAndMessaging::HWND_TOPMOST;
 use windows::Win32::UI::WindowsAndMessaging::IsIconic;
 use windows::Win32::UI::WindowsAndMessaging::SC_MINIMIZE;
 use windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE;
+use windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE;
 use windows::Win32::UI::WindowsAndMessaging::WINDOWPOS;
 use windows::Win32::UI::WindowsAndMessaging::WM_SYSCOMMAND;
 use windows::Win32::UI::WindowsAndMessaging::WM_WINDOWPOSCHANGING;
@@ -181,18 +191,142 @@ pub struct WorkspaceAnimationConfig {
     pub border: Option<WorkspaceAnimationBorder>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+/// Window move and resize animation configuration. When enabled, windows are moved and resized
+/// with stretched thumbnails on an overlay instead of the per-frame movement animation.
+pub struct WindowAnimationConfig {
+    /// Enable or disable overlay window animations (default: true when this section is present)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Animation duration in ms (default: follows the movement animation duration)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u64>,
+    /// A CSS-style cubic bezier curve `[x1, y1, x2, y2]` which overrides the animation style
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bezier: Option<[f64; 4]>,
+}
+
 lazy_static! {
     static ref CONFIG: Mutex<WorkspaceAnimationConfig> =
         Mutex::new(WorkspaceAnimationConfig::default());
+    static ref WINDOW_CONFIG: Mutex<Option<WindowAnimationConfig>> = Mutex::new(None);
+    /// Monitors (by hmonitor) on which a workspace switch is currently animating
+    static ref SWITCHING_MONITORS: Mutex<HashSet<isize>> = Mutex::new(HashSet::new());
     /// The workspace index currently on screen for each monitor (by hmonitor)
     static ref SHOWN_WORKSPACES: Mutex<HashMap<isize, usize>> = Mutex::new(HashMap::new());
 }
 
-static ANIMATOR: OnceLock<Sender<Command>> = OnceLock::new();
+static ANIMATOR: OnceLock<Sender<Job>> = OnceLock::new();
 static ANIMATION_RUNNING: AtomicCell<bool> = AtomicCell::new(false);
 
 pub fn set_config(config: Option<WorkspaceAnimationConfig>) {
     *CONFIG.lock() = config.unwrap_or_default();
+
+    // start the animator now, so that the blurred backdrop is ready for the first animation
+    animator();
+}
+
+pub fn set_window_config(config: Option<WindowAnimationConfig>) {
+    *WINDOW_CONFIG.lock() = config;
+}
+
+fn window_animations_enabled() -> bool {
+    let Some(enabled) = WINDOW_CONFIG.lock().as_ref().map(|c| c.enabled.unwrap_or(true)) else {
+        return false;
+    };
+
+    enabled
+        && ANIMATION_ENABLED_PER_ANIMATION
+            .lock()
+            .get(&AnimationPrefix::Movement)
+            .copied()
+            .unwrap_or_else(|| ANIMATION_ENABLED_GLOBAL.load(Ordering::SeqCst))
+}
+
+/// Called by a workspace right before it moves its windows to `moves` (window, layout rect).
+/// Returns true when an overlay animation now covers the work area, in which case the caller
+/// must place the windows at their targets right away instead of animating them itself.
+pub fn windows_moving(workspace: &Workspace, moves: &[(isize, Rect)]) -> bool {
+    if !window_animations_enabled() || crate::animation::movement_animations_suppressed() {
+        return false;
+    }
+
+    let shown = |hwnd: isize| {
+        WindowsApi::is_window(hwnd) && !WindowsApi::is_window_cloaked(hwnd).unwrap_or(true)
+    };
+
+    // hidden workspaces are laid out too; only the one on screen is animated
+    let changed = moves.iter().any(|(hwnd, target)| {
+        shown(*hwnd) && WindowsApi::window_rect(*hwnd).is_ok_and(|rect| rect != *target)
+    });
+    if !changed {
+        return false;
+    }
+
+    let wa = workspace.globals.work_area;
+    let hmonitor = WindowsApi::monitor_from_point(POINT {
+        x: wa.left + wa.right / 2,
+        y: wa.top + wa.bottom / 2,
+    });
+
+    // a workspace switch overlay already shows these windows at their live positions
+    if SWITCHING_MONITORS.lock().contains(&hmonitor) {
+        return false;
+    }
+
+    let managed = visible_windows(workspace)
+        .into_iter()
+        .filter(|hwnd| shown(*hwnd))
+        .collect::<Vec<_>>();
+
+    // unmanaged windows on the monitor (eg. desktop pets, apps komorebi ignores) are put on
+    // the overlay too, as they would otherwise vanish while it covers the work area
+    let windows = managed
+        .iter()
+        .map(|hwnd| (*hwnd, true))
+        .chain(unmanaged_windows(wa, &managed).into_iter().map(|hwnd| (hwnd, false)))
+        .filter_map(|(hwnd, managed)| {
+            let target = moves.iter().find(|(h, _)| *h == hwnd).map(|(_, layout)| RECT {
+                left: layout.left,
+                top: layout.top,
+                right: layout.left + layout.right,
+                bottom: layout.top + layout.bottom,
+            });
+
+            Some(WindowMove {
+                hwnd,
+                frame: frame_rect(hwnd).or_else(|| raw_window_rect(hwnd))?,
+                target,
+                managed,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let focused = workspace
+        .monocle_container
+        .as_ref()
+        .and_then(|c| c.focused_window())
+        .or_else(|| workspace.focused_container().and_then(|c| c.focused_window()))
+        .map(|window| window.hwnd);
+
+    let (ack_sender, ack_receiver) = crossbeam_channel::bounded(1);
+    let job = Job::Windows(WindowsCommand {
+        hmonitor,
+        work_area: wa,
+        windows,
+        focused,
+        ack: ack_sender,
+    });
+
+    if animator().send(job).is_err() {
+        return false;
+    }
+
+    // even if the overlay is late, the thumbnails track the live window positions, so the
+    // windows still have to be placed directly
+    let _ = ack_receiver.recv_timeout(OVERLAY_READY_TIMEOUT);
+    true
 }
 
 pub fn enabled() -> bool {
@@ -265,8 +399,11 @@ pub fn workspace_shown(
         ack: ack_sender,
     };
 
-    if animator().send(command).is_ok() {
+    SWITCHING_MONITORS.lock().insert(hmonitor);
+    if animator().send(Job::Workspace(command)).is_ok() {
         let _ = ack_receiver.recv_timeout(OVERLAY_READY_TIMEOUT);
+    } else {
+        SWITCHING_MONITORS.lock().remove(&hmonitor);
     }
 }
 
@@ -309,14 +446,48 @@ struct Command {
     ack: Sender<()>,
 }
 
+struct WindowMove {
+    hwnd: isize,
+    /// The visible frame before the move
+    frame: RECT,
+    /// The visible frame komorebi lays the window out at, if it is being placed
+    target: Option<RECT>,
+    /// Managed by the workspace, as opposed to some other window over the work area
+    managed: bool,
+}
+
+/// Windows of the workspace on screen are about to be moved or resized
+struct WindowsCommand {
+    hmonitor: isize,
+    work_area: Rect,
+    /// Every visible window over the work area
+    windows: Vec<WindowMove>,
+    focused: Option<isize>,
+    ack: Sender<()>,
+}
+
+enum Job {
+    Workspace(Command),
+    Windows(WindowsCommand),
+}
+
 struct Thumbnail {
     id: isize,
     hwnd: isize,
     /// Blurred wallpaper drawn right underneath the window, standing in for its backdrop
     blur_patch: Option<isize>,
     incoming: bool,
-    /// Rect of an outgoing window when the animation started (screen coordinates)
+    /// Rect of an outgoing window when the animation started, or of any window when a window
+    /// animation started (screen coordinates)
     start_rect: RECT,
+    /// Where the thumbnail was last drawn (screen coordinates)
+    current: RECT,
+    /// Window animations: the frame of the window before it was placed, and where komorebi
+    /// placed it. Some windows report their new frame a few frames late, so the layout target
+    /// is used until the window has visibly moved, and the live frame (which is where windows
+    /// with a minimum size really end up) after that.
+    placed_from: RECT,
+    target: Option<RECT>,
 }
 
 /// A copy of a thumbnail's fields, so that rendering can update borders while iterating
@@ -342,9 +513,11 @@ struct Animation {
     started: Instant,
     duration: Duration,
     focused: [Option<isize>; 2],
+    /// Moves and resizes windows in place instead of switching workspaces
+    windows: bool,
 }
 
-fn animator() -> &'static Sender<Command> {
+fn animator() -> &'static Sender<Job> {
     ANIMATOR.get_or_init(|| {
         let (sender, receiver) = crossbeam_channel::unbounded();
         std::thread::spawn(move || run(receiver));
@@ -419,6 +592,22 @@ fn create_overlay() -> Option<isize> {
     Some(hwnd.0 as isize)
 }
 
+/// Shows the overlay once its thumbnails are in place; shown any earlier, it can be
+/// composited for a frame or two as a plain black window
+fn show_overlay(overlay: isize) {
+    unsafe {
+        let _ = SetWindowPos(
+            HWND(overlay as _),
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+    }
+}
+
 fn pump_messages() {
     let mut msg = MSG::default();
     unsafe {
@@ -465,6 +654,56 @@ fn sort_bottom_to_top(hwnds: &mut [isize]) {
     }
 
     hwnds.sort_by_key(|hwnd| std::cmp::Reverse(z_order.get(hwnd).copied().unwrap_or(0)));
+}
+
+/// Visible top-level windows over the work area which are not in `managed`, skipping tool
+/// windows (which includes full screen overlays like the NVIDIA one), the desktop and borders
+fn unmanaged_windows(work_area: Rect, managed: &[isize]) -> Vec<isize> {
+    let mut hwnds = vec![];
+    let mut current = unsafe { GetTopWindow(None) }.ok();
+
+    while let Some(hwnd) = current {
+        current = unsafe { GetWindow(hwnd, GW_HWNDNEXT) }.ok();
+        let raw = hwnd.0 as isize;
+
+        if managed.contains(&raw)
+            || !WindowsApi::is_window_visible(raw)
+            || WindowsApi::is_iconic(raw)
+            || WindowsApi::is_window_cloaked(raw).unwrap_or(true)
+        {
+            continue;
+        }
+
+        let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+        if ex_style & WS_EX_TOOLWINDOW.0 != 0 {
+            continue;
+        }
+
+        let mut class = [0u16; 64];
+        let len = unsafe { GetClassNameW(hwnd, &mut class) } as usize;
+        let class = String::from_utf16_lossy(&class[..len]);
+        if matches!(
+            class.as_str(),
+            "Progman" | "WorkerW" | "border" | "Shell_TrayWnd" | "Windows.UI.Core.CoreWindow"
+        )
+            || class.starts_with("komorebi")
+        {
+            continue;
+        }
+
+        let Some(rect) = raw_window_rect(raw) else {
+            continue;
+        };
+        let overlaps = rect.left < work_area.left + work_area.right
+            && rect.right > work_area.left
+            && rect.top < work_area.top + work_area.bottom
+            && rect.bottom > work_area.top;
+        if overlaps && rect.right > rect.left && rect.bottom > rect.top {
+            hwnds.push(raw);
+        }
+    }
+
+    hwnds
 }
 
 fn register(overlay: isize, source: isize) -> Option<isize> {
@@ -951,7 +1190,7 @@ impl Animation {
                 wa.top,
                 wa.right,
                 wa.bottom,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                SWP_NOACTIVATE,
             );
         }
 
@@ -979,14 +1218,18 @@ impl Animation {
                 // right underneath it
                 let blur_patch = blur.and_then(|blur| register(overlay, blur.hwnd));
                 if let Some(id) = register(overlay, hwnd) {
+                    let start_rect = frame_rect(hwnd)
+                        .or_else(|| raw_window_rect(hwnd))
+                        .unwrap_or_default();
                     thumbnails.push(Thumbnail {
                         id,
                         hwnd,
                         blur_patch,
                         incoming: is_incoming,
-                        start_rect: frame_rect(hwnd)
-                            .or_else(|| raw_window_rect(hwnd))
-                            .unwrap_or_default(),
+                        start_rect,
+                        current: start_rect,
+                        placed_from: start_rect,
+                        target: None,
                     });
                 }
             }
@@ -1020,9 +1263,111 @@ impl Animation {
             started: Instant::now(),
             duration: Duration::from_millis(duration.max(1)),
             focused: command.focused,
+            windows: false,
         };
 
         animation.render(0.0);
+        show_overlay(overlay);
+        animation
+    }
+
+    /// Starts moving and resizing windows in place. Windows which were still animating on
+    /// `previous` continue from where they are drawn, so rapid changes chain smoothly.
+    fn start_windows(
+        command: &WindowsCommand,
+        overlay: isize,
+        blur: Option<&BlurSurface>,
+        border_surfaces: &mut Vec<BlurSurface>,
+        previous: Option<&Animation>,
+    ) -> Self {
+        let config = WINDOW_CONFIG.lock().clone().unwrap_or_default();
+        let duration = config.duration.unwrap_or_else(|| {
+            ANIMATION_DURATION_PER_ANIMATION
+                .lock()
+                .get(&AnimationPrefix::Movement)
+                .copied()
+                .unwrap_or_else(|| ANIMATION_DURATION_GLOBAL.load(Ordering::SeqCst))
+        });
+
+        let wa = command.work_area;
+        unsafe {
+            let _ = SetWindowPos(
+                HWND(overlay as _),
+                Some(HWND_TOPMOST),
+                wa.left,
+                wa.top,
+                wa.right,
+                wa.bottom,
+                SWP_NOACTIVATE,
+            );
+        }
+
+        let wallpaper = desktop_window().and_then(|desktop| register(overlay, desktop));
+
+        let mut hwnds = command.windows.iter().map(|window| window.hwnd).collect::<Vec<_>>();
+        sort_bottom_to_top(&mut hwnds);
+
+        let blur = blur.filter(|blur| blur.width > 0 && CONFIG.lock().backdrop_blur.unwrap_or(true));
+        if let Some(blur) = blur {
+            blur.ensure_restored();
+        }
+
+        let mut thumbnails = vec![];
+        for hwnd in hwnds {
+            let Some(window) = command.windows.iter().find(|window| window.hwnd == hwnd) else {
+                continue;
+            };
+            let start_rect = previous
+                .and_then(|previous| previous.thumbnails.iter().find(|t| t.hwnd == hwnd))
+                .map_or(window.frame, |thumbnail| thumbnail.current);
+
+            // unmanaged windows can be any shape (eg. a desktop pet), so they get no backdrop
+            let blur_patch = blur
+                .filter(|_| window.managed)
+                .and_then(|blur| register(overlay, blur.hwnd));
+            if let Some(id) = register(overlay, hwnd) {
+                thumbnails.push(Thumbnail {
+                    id,
+                    hwnd,
+                    blur_patch,
+                    incoming: true,
+                    start_rect,
+                    current: start_rect,
+                    placed_from: window.frame,
+                    target: window.target,
+                });
+            }
+        }
+
+        let mut borders = vec![];
+        if CONFIG.lock().border.is_some()
+            && command.focused.is_some_and(|f| thumbnails.iter().any(|t| t.hwnd == f))
+            && let Some(surface) = border_surfaces.pop().or_else(BlurSurface::new)
+        {
+            surface.ensure_restored();
+            match register(overlay, surface.hwnd) {
+                Some(id) => borders.push((id, surface, true)),
+                None => border_surfaces.push(surface),
+            }
+        }
+
+        let mut animation = Self {
+            overlay,
+            work_area: wa,
+            wallpaper,
+            thumbnails,
+            borders,
+            blur: blur.map(|blur| (blur.desktop, blur.width, blur.height)),
+            forward: true,
+            kind: WorkspaceAnimationKind::Slide,
+            started: Instant::now(),
+            duration: Duration::from_millis(duration.max(1)),
+            focused: [None, command.focused],
+            windows: true,
+        };
+
+        animation.render(0.0);
+        show_overlay(overlay);
         animation
     }
 
@@ -1030,14 +1375,23 @@ impl Animation {
         (self.started.elapsed().as_secs_f64() / self.duration.as_secs_f64()).min(1.0)
     }
 
-    fn eased(progress: f64) -> f64 {
-        if let Some(curve) = CONFIG.lock().bezier {
+    fn eased(&self, progress: f64) -> f64 {
+        let (curve, prefix) = if self.windows {
+            (
+                WINDOW_CONFIG.lock().as_ref().and_then(|c| c.bezier),
+                AnimationPrefix::Movement,
+            )
+        } else {
+            (CONFIG.lock().bezier, AnimationPrefix::Workspace)
+        };
+
+        if let Some(curve) = curve {
             return cubic_bezier(curve, progress);
         }
 
         let style = ANIMATION_STYLE_PER_ANIMATION
             .lock()
-            .get(&AnimationPrefix::Workspace)
+            .get(&prefix)
             .copied()
             .unwrap_or_else(|| *ANIMATION_STYLE_GLOBAL.lock());
 
@@ -1046,7 +1400,7 @@ impl Animation {
 
     fn render(&mut self, progress: f64) {
         let wa = self.work_area;
-        let eased = Self::eased(progress);
+        let eased = self.eased(progress);
         let slide_fade_distance = CONFIG.lock().slide_fade_distance.unwrap_or(0.2);
         let config_border = CONFIG.lock().border.clone();
 
@@ -1108,9 +1462,37 @@ impl Animation {
                 thumbnail.start_rect
             };
 
+            // window animations stretch each thumbnail from where the window was to where it
+            // is now laid out
+            let rect = if self.windows {
+                let start = thumbnail.start_rect;
+                let (placed_from, target) = (
+                    self.thumbnails[idx].placed_from,
+                    self.thumbnails[idx].target,
+                );
+                let rect = match target {
+                    Some(target) if rect == placed_from => target,
+                    _ => rect,
+                };
+                #[allow(clippy::cast_possible_truncation)]
+                let lerp = |from: i32, to: i32| {
+                    (f64::from(from) + f64::from(to - from) * eased).round() as i32
+                };
+                RECT {
+                    left: lerp(start.left, rect.left),
+                    top: lerp(start.top, rect.top),
+                    right: lerp(start.right, rect.right),
+                    bottom: lerp(start.bottom, rect.bottom),
+                }
+            } else {
+                rect
+            };
+
             // outgoing windows travel one extent in the direction of travel, while incoming
             // windows start one extent away on the opposite side and arrive in place
-            let (offset, opacity) = if thumbnail.incoming {
+            let (offset, opacity) = if self.windows {
+                (0.0, 1.0)
+            } else if thumbnail.incoming {
                 (-direction * extent * (1.0 - eased), eased.clamp(0.0, 1.0))
             } else {
                 (direction * extent * eased, (1.0 - eased).clamp(0.0, 1.0))
@@ -1135,6 +1517,12 @@ impl Animation {
             };
 
             update(thumbnail.id, destination, None, opacity);
+            self.thumbnails[idx].current = RECT {
+                left: destination.left + wa.left,
+                top: destination.top + wa.top,
+                right: destination.right + wa.left,
+                bottom: destination.bottom + wa.top,
+            };
 
             if let Some(border) = &config_border {
                 let side = usize::from(thumbnail.incoming);
@@ -1178,6 +1566,13 @@ impl Animation {
     }
 
     fn finish(self, hide_overlay: bool, border_surfaces: &mut Vec<BlurSurface>) {
+        // hide the overlay before its thumbnails go, or it can be composited empty (black)
+        if hide_overlay {
+            unsafe {
+                let _ = ShowWindow(HWND(self.overlay as _), SW_HIDE);
+            }
+        }
+
         for (id, surface, _) in self.borders {
             let _ = unsafe { DwmUnregisterThumbnail(id) };
             border_surfaces.push(surface);
@@ -1193,16 +1588,10 @@ impl Animation {
         if let Some(wallpaper) = self.wallpaper {
             let _ = unsafe { DwmUnregisterThumbnail(wallpaper) };
         }
-
-        if hide_overlay {
-            unsafe {
-                let _ = ShowWindow(HWND(self.overlay as _), SW_HIDE);
-            }
-        }
     }
 }
 
-fn run(receiver: Receiver<Command>) {
+fn run(receiver: Receiver<Job>) {
     let mut overlays: HashMap<isize, isize> = HashMap::new();
     let mut animations: HashMap<isize, Animation> = HashMap::new();
     let mut blur: Option<BlurSurface> = None;
@@ -1249,31 +1638,57 @@ fn run(receiver: Receiver<Command>) {
             receiver.try_recv().ok()
         };
 
-        if let Some(command) = command {
+        if let Some(job) = command {
             ANIMATION_RUNNING.store(true);
 
-            // a new switch on a monitor which is still animating replaces that animation;
-            // the overlay stays up so there is no flash of the real windows in between
-            if let Some(previous) = animations.remove(&command.hmonitor) {
-                previous.finish(false, &mut border_surfaces);
-            }
+            let hmonitor = match &job {
+                Job::Workspace(command) => command.hmonitor,
+                Job::Windows(command) => command.hmonitor,
+            };
 
-            let overlay = match overlays.get(&command.hmonitor) {
+            // a new animation on a monitor which is still animating replaces that animation;
+            // the overlay stays up so there is no flash of the real windows in between
+            let mut previous = animations.remove(&hmonitor);
+
+            let overlay = match overlays.get(&hmonitor) {
                 Some(overlay) => Some(*overlay),
                 None => create_overlay().inspect(|overlay| {
-                    overlays.insert(command.hmonitor, *overlay);
+                    overlays.insert(hmonitor, *overlay);
                 }),
             };
 
-            if let Some(overlay) = overlay {
-                let animation =
-                    Animation::start(&command, overlay, blur.as_ref(), &mut border_surfaces);
-                // make sure the overlay has been composited before the real switch happens
-                let _ = unsafe { DwmFlush() };
-                animations.insert(command.hmonitor, animation);
+            let animation = overlay.map(|overlay| match &job {
+                Job::Workspace(command) => {
+                    if let Some(previous) = previous.take() {
+                        previous.finish(false, &mut border_surfaces);
+                    }
+                    Animation::start(command, overlay, blur.as_ref(), &mut border_surfaces)
+                }
+                Job::Windows(command) => Animation::start_windows(
+                    command,
+                    overlay,
+                    blur.as_ref(),
+                    &mut border_surfaces,
+                    previous.as_ref(),
+                ),
+            });
+
+            if let Some(previous) = previous {
+                previous.finish(false, &mut border_surfaces);
             }
 
-            let _ = command.ack.send(());
+            if let Some(animation) = animation {
+                // make sure the overlay has been composited before the real windows change
+                let _ = unsafe { DwmFlush() };
+                animations.insert(hmonitor, animation);
+            } else if matches!(job, Job::Workspace(_)) {
+                SWITCHING_MONITORS.lock().remove(&hmonitor);
+            }
+
+            let _ = match &job {
+                Job::Workspace(command) => command.ack.send(()),
+                Job::Windows(command) => command.ack.send(()),
+            };
             pump_messages();
             continue;
         }
@@ -1295,6 +1710,9 @@ fn run(receiver: Receiver<Command>) {
 
         for hmonitor in finished {
             if let Some(animation) = animations.remove(&hmonitor) {
+                if !animation.windows {
+                    SWITCHING_MONITORS.lock().remove(&hmonitor);
+                }
                 animation.finish(true, &mut border_surfaces);
             }
         }

@@ -685,13 +685,17 @@ impl Workspace {
 
         let managed_maximized_window = self.maximized_window.is_some();
 
+        // windows are placed after the layout has been worked out, so that all of them can be
+        // animated together on an overlay
+        let mut moves: Vec<(Window, Rect, bool)> = vec![];
+
         if self.tile {
             if let Some(container) = &mut self.monocle_container {
                 if let Some(window) = container.focused_window_mut() {
                     adjusted_work_area.add_padding(container_padding);
                     adjusted_work_area.add_padding(border_offset);
                     adjusted_work_area.add_padding(border_width);
-                    window.set_position(&adjusted_work_area, true)?;
+                    moves.push((*window, adjusted_work_area, true));
                 };
             } else if let Some(window) = &mut self.maximized_window {
                 window.maximize();
@@ -766,12 +770,31 @@ impl Workspace {
                                     WindowsApi::restore_window(window.hwnd);
                                 }
                             }
-                            window.set_position(layout, false)?;
+                            moves.push((*window, *layout, false));
                         }
                     }
                 }
 
                 self.latest_layout = layouts;
+            }
+        }
+
+        if !moves.is_empty() {
+            let targets = moves
+                .iter()
+                .map(|(window, rect, _)| (window.hwnd, *rect))
+                .collect::<Vec<_>>();
+
+            if crate::animation::workspace::windows_moving(self, &targets) {
+                for (window, rect, top) in &moves {
+                    if WindowsApi::window_rect(window.hwnd).is_ok_and(|current| current != *rect) {
+                        WindowsApi::position_window(window.hwnd, rect, *top, true)?;
+                    }
+                }
+            } else {
+                for (window, rect, top) in &moves {
+                    window.set_position(rect, *top)?;
+                }
             }
         }
 

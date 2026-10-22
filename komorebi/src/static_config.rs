@@ -698,6 +698,9 @@ pub struct AnimationsConfig {
     /// Workspace switch animation options
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<crate::animation::workspace::WorkspaceAnimationConfig>,
+    /// Window move and resize animation options
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub windows: Option<crate::animation::workspace::WindowAnimationConfig>,
 }
 
 pub use komorebi_themes::KomorebiTheme;
@@ -1027,6 +1030,7 @@ impl StaticConfig {
             );
 
             crate::animation::workspace::set_config(animations.workspace.clone());
+            crate::animation::workspace::set_window_config(animations.windows.clone());
         }
 
         if let Some(container) = self.default_container_padding {
