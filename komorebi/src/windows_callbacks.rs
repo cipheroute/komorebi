@@ -129,6 +129,16 @@ pub extern "system" fn win_event_hook(
         border_manager::send_notification(Some(hwnd.0 as isize));
     }
 
+    // windows which open themselves at application start (eg. the Steam friends list) are
+    // usually named while still hidden, so they are closed right here before they ever show
+    if matches!(winevent, WinEvent::ObjectNameChange | WinEvent::ObjectShow)
+        && window.closes_at_app_start()
+    {
+        tracing::info!("closing {} as it opened itself at application start", window.hwnd);
+        let _ = window.close();
+        return;
+    }
+
     let event_type = match WindowManagerEvent::from_win_event(winevent, window) {
         None => {
             tracing::trace!(
