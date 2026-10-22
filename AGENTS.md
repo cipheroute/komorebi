@@ -1,7 +1,7 @@
 # Instructions for AI coding agents
 
 You are setting up a personal fork of komorebi (a tiling window manager for Windows) with
-Hyprland-like animations. Read [FORK.md](./FORK.md) first. The fork is published as is and
+Hyprland-like animations. Read [README.md](./README.md) first. The fork is published as is and
 was tested on one machine only, so expect to adapt things; the user you work for owns that.
 
 Do not distribute any binaries you build: the [license](./LICENSE.md) only allows
@@ -48,14 +48,14 @@ komorebi restarts. Restore the `.original-0.1.41` files to roll back.
 
 ## 4. Configure
 
-Add the `animation` section from FORK.md to the user's `komorebi.json` (usually
+Add the `animation` section from README.md to the user's `komorebi.json` (usually
 `%USERPROFILE%\komorebi.json`; `komorebic configuration` prints the path) and merge it with
 what is there rather than replacing their config. Then `komorebic reload-configuration` or
 restart komorebi.
 
 - Write the JSON as UTF-8 **without a BOM**: komorebi silently ignores a file with a BOM
   (PowerShell 5's `Set-Content -Encoding utf8` writes one).
-- The `backdrop_profiles` values in FORK.md were measured on the author's machine. Leave
+- The `backdrop_profiles` values in README.md were measured on the author's machine. Leave
   them out unless the user has Windows Terminal / Zed with the same look; without a profile
   a default acrylic is used.
 - Validate by switching workspaces (eg. `komorebic focus-workspace 1`) and watching
