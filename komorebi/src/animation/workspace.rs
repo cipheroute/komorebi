@@ -482,8 +482,13 @@ pub fn workspace_shown(
     };
 
     SWITCHING_MONITORS.lock().insert(hmonitor);
+    // when the overlay is already up from the previous switch, the real windows change
+    // underneath it anyway, so rapid switches don't wait for the next animation to start
+    let covered = COVERED_MONITORS.lock().contains(&hmonitor);
     if animator().send(Job::Workspace(command)).is_ok() {
-        let _ = ack_receiver.recv_timeout(OVERLAY_READY_TIMEOUT);
+        if !covered {
+            let _ = ack_receiver.recv_timeout(OVERLAY_READY_TIMEOUT);
+        }
     } else {
         SWITCHING_MONITORS.lock().remove(&hmonitor);
     }

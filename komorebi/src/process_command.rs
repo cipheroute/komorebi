@@ -16,6 +16,7 @@ use std::net::TcpStream;
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use uds_windows::UnixStream;
@@ -2328,6 +2329,34 @@ if (!(Get-Process komorebi-bar -ErrorAction SilentlyContinue))
     }
 }
 
+/// Sequence numbers of received commands, used to skip workspace switches which have already
+/// been superseded by a newer one by the time they get the window manager lock
+static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static LATEST_WORKSPACE_FOCUS: AtomicU64 = AtomicU64::new(0);
+static LATEST_OTHER_COMMAND: AtomicU64 = AtomicU64::new(0);
+
+/// Every command arrives on its own connection and thread, so when commands come faster than
+/// they can be processed (eg. a hotkey pressed rapidly) they would race for the lock in any
+/// order. A switch to an absolute workspace which has been followed by another one, and by
+/// nothing else, is skipped, so that the last workspace asked for always wins.
+fn superseded_workspace_focus(message: &SocketMessage) -> Option<u64> {
+    let sequence = COMMAND_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1;
+    match message {
+        SocketMessage::FocusWorkspaceNumber(_)
+        | SocketMessage::FocusWorkspaceNumbers(_)
+        | SocketMessage::FocusMonitorWorkspaceNumber(_, _)
+        | SocketMessage::FocusNamedWorkspace(_) => {
+            LATEST_WORKSPACE_FOCUS.fetch_max(sequence, Ordering::SeqCst);
+            Some(sequence)
+        }
+        SocketMessage::State | SocketMessage::GlobalState | SocketMessage::Query(_) => None,
+        _ => {
+            LATEST_OTHER_COMMAND.fetch_max(sequence, Ordering::SeqCst);
+            None
+        }
+    }
+}
+
 pub fn read_commands_uds(
     wm: &Arc<Mutex<WindowManager>>,
     mut stream: UnixStream,
@@ -2339,6 +2368,7 @@ pub fn read_commands_uds(
     // socket shutdown.
     for line in reader.lines() {
         let message = SocketMessage::from_str(&line?)?;
+        let workspace_focus = superseded_workspace_focus(&message);
 
         match wm.try_lock_for(Duration::from_secs(1)) {
             None => {
@@ -2358,6 +2388,14 @@ pub fn read_commands_uds(
                             Ok(())
                         }
                     };
+                }
+
+                if let Some(sequence) = workspace_focus
+                    && LATEST_WORKSPACE_FOCUS.load(Ordering::SeqCst) > sequence
+                    && LATEST_OTHER_COMMAND.load(Ordering::SeqCst) < sequence
+                {
+                    tracing::info!("skipping {message}, a newer workspace switch is pending");
+                    continue;
                 }
 
                 wm.process_command(message.clone(), &mut stream)?;

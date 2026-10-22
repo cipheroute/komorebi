@@ -428,7 +428,20 @@ impl WindowManager {
                     ) {
                         needs_reconciliation = self.needs_reconciliation(window)?;
 
-                        if let Some((m_idx, ws_idx)) = needs_reconciliation {
+                        if needs_reconciliation.is_some()
+                            && matches!(event, WindowManagerEvent::Uncloak(_, _))
+                            && crate::window_manager::workspace_focused_recently()
+                        {
+                            tracing::info!(
+                                "ignoring uncloak of a window on another workspace right after a workspace switch"
+                            );
+                            window.hide();
+                            if let Ok(focused) = self.focused_window() {
+                                focused.focus(false)?;
+                            }
+                            needs_reconciliation = None;
+                            proceed = false;
+                        } else if let Some((m_idx, ws_idx)) = needs_reconciliation {
                             self.perform_reconciliation(window, (m_idx, ws_idx))?;
 
                             // Since there was a reconciliation after an `alt-tab`, that means this

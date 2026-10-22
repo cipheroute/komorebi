@@ -9,6 +9,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use std::sync::atomic::Ordering;
 
 use color_eyre::eyre;
@@ -68,6 +69,18 @@ use crate::windows_api::WindowsApi;
 use crate::winevent_listener;
 use crate::workspace::Workspace;
 use crate::workspace::WorkspaceLayer;
+
+/// When a workspace was last focused (eg. by a hotkey)
+static LAST_WORKSPACE_FOCUS: Mutex<Option<Instant>> = parking_lot::const_mutex(None);
+
+/// Applications which were focused on a workspace which is switched away from right after
+/// (eg. by rapid hotkey presses) can grab the focus back, and uncloak themselves, a few hundred
+/// milliseconds later; this is not the user switching to them with alt-tab
+pub fn workspace_focused_recently() -> bool {
+    LAST_WORKSPACE_FOCUS
+        .lock()
+        .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(700))
+}
 
 #[derive(Debug)]
 pub struct WindowManager {
@@ -3776,12 +3789,30 @@ impl WindowManager {
     pub fn focus_workspace(&mut self, idx: usize) -> eyre::Result<()> {
         tracing::info!("focusing workspace");
 
+        *LAST_WORKSPACE_FOCUS.lock() = Some(Instant::now());
+
+        self.focused_monitor_mut()
+            .ok_or_eyre("there is no workspace")?
+            .focus_workspace(idx)?;
+
+        // subscribers (eg. status bars) learn about the new workspace and the window which is
+        // about to be focused on it right away, instead of after the switch has been carried out
+        if let Err(error) = crate::notify_subscribers(
+            crate::Notification {
+                event: crate::NotificationEvent::Socket(
+                    crate::SocketMessage::FocusWorkspaceNumber(idx),
+                ),
+                state: State::from(&*self),
+            },
+            true,
+        ) {
+            tracing::warn!("could not notify subscribers of the workspace switch: {error}");
+        }
+
         let mouse_follows_focus = self.mouse_follows_focus;
         let monitor = self
             .focused_monitor_mut()
             .ok_or_eyre("there is no workspace")?;
-
-        monitor.focus_workspace(idx)?;
         monitor.load_focused_workspace(mouse_follows_focus)?;
 
         self.update_focused_workspace(false, true)
