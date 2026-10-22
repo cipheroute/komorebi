@@ -1067,6 +1067,9 @@ enum SubCommand {
     DataDirectory,
     /// Show a JSON representation of the current window manager state
     State,
+    /// Show why komorebi does or doesn't manage a window
+    #[clap(hide = true)]
+    DebugWindow { hwnd: isize },
     /// Show a JSON representation of the current global state
     GlobalState,
     /// Launch the komorebi-gui debugging tool
@@ -3103,6 +3106,9 @@ if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
         }
         SubCommand::State => {
             print_query(&SocketMessage::State);
+        }
+        SubCommand::DebugWindow { hwnd } => {
+            print_query(&SocketMessage::DebugWindow(hwnd));
         }
         SubCommand::GlobalState => {
             print_query(&SocketMessage::GlobalState);
