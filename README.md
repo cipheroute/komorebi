@@ -83,6 +83,10 @@ New fields in `komorebi.json` (the published schema doesn't know them, the fork 
 | `windows` | window move/resize animations on the overlay (on when the section is present) |
 | `close_at_app_start_rules` | windows closed when they appear within 40 s of their process starting |
 
+## My configs
+
+The komorebi, whkd and yasb configs from the demo are in [`dotfiles/`](./dotfiles).
+
 ## Optional extras (patches, not part of this repository's build)
 
 In [`fork-patches/`](./fork-patches):
